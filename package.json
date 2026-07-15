@@ -1,0 +1,58 @@
+{
+  "name": "pi-herdr-btw",
+  "version": "0.1.0",
+  "description": "Open a tool-enabled Pi side thread in a focused Herdr pane without changing the parent transcript.",
+  "type": "module",
+  "author": "Oscar Gabriel",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oscabriel/pi-herdr-btw.git"
+  },
+  "bugs": {
+    "url": "https://github.com/oscabriel/pi-herdr-btw/issues"
+  },
+  "homepage": "https://github.com/oscabriel/pi-herdr-btw#readme",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "herdr",
+    "side-thread",
+    "btw"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "check": "npm run typecheck && npm test",
+    "pack:check": "npm pack --dry-run",
+    "prepublishOnly": "npm run check && npm run pack:check"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.80.7",
+    "@earendil-works/pi-coding-agent": "^0.80.7",
+    "@types/node": "^24.12.4",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
