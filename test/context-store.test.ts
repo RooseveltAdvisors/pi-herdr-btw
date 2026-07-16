@@ -14,7 +14,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { ContextStore } from "../src/context-store.ts";
-import { createPayload } from "../src/core.ts";
+import {
+	MERGE_PROTOCOL_VERSION,
+	type MergeAck,
+	type MergeRequest,
+} from "../src/merge.ts";
+import { fixturePayload as buildFixturePayload } from "./fixtures.ts";
 
 async function createFixture(t: test.TestContext): Promise<{
 	base: string;
@@ -31,7 +36,19 @@ async function createFixture(t: test.TestContext): Promise<{
 }
 
 function fixturePayload(question = "draft") {
-	return createPayload("2026-07-15T00:00:00.000Z", "# Context", question);
+	return buildFixturePayload({ draftQuestion: question });
+}
+
+function fixtureRequest(payload: ReturnType<typeof fixturePayload>): MergeRequest {
+	return {
+		protocolVersion: MERGE_PROTOCOL_VERSION,
+		requestId: "req-1",
+		launchId: payload.launchId,
+		parentSessionId: payload.parentSessionId,
+		capability: payload.capability,
+		createdAt: "2026-07-15T00:00:00.000Z",
+		summary: "reviewed summary",
+	};
 }
 
 test("ContextStore creates, reads, and removes a private launch payload", async (t) => {
@@ -58,7 +75,7 @@ test("ContextStore removes the launch directory when payload creation fails", as
 	const { root, store } = await createFixture(t);
 	const unserializable = {
 		...fixturePayload(),
-		contextDocument: 1n,
+		parentSystemPrompt: 1n,
 	} as unknown as ReturnType<typeof fixturePayload>;
 
 	await assert.rejects(store.create(unserializable), /BigInt/);
@@ -117,6 +134,91 @@ test("ContextStore removes stale launches and preserves fresh launches", async (
 	await store.removeStale(5_000, now);
 	await assert.rejects(access(stalePath));
 	await access(freshPath);
+});
+
+test("ContextStore round-trips merge requests and acks with private modes", async (t) => {
+	const { store } = await createFixture(t);
+	const payload = fixturePayload();
+	const payloadPath = await store.create(payload);
+	const request = fixtureRequest(payload);
+
+	assert.equal(await store.readMergeRequest(payloadPath), undefined);
+	await store.writeMergeRequest(payloadPath, request);
+	assert.deepEqual(await store.readMergeRequest(payloadPath), request);
+	if (process.platform !== "win32") {
+		const requestPath = join(dirname(payloadPath), "merge-request.json");
+		assert.equal((await lstat(requestPath)).mode & 0o777, 0o600);
+	}
+
+	const ack: MergeAck = {
+		protocolVersion: MERGE_PROTOCOL_VERSION,
+		requestId: request.requestId,
+		status: "accepted",
+		processedAt: "2026-07-15T00:01:00.000Z",
+	};
+	assert.equal(await store.readMergeAck(payloadPath), undefined);
+	await store.writeMergeAck(payloadPath, ack);
+	assert.deepEqual(await store.readMergeAck(payloadPath), ack);
+});
+
+test("ContextStore rejects invalid and oversized mailbox writes", async (t) => {
+	const { store } = await createFixture(t);
+	const payload = fixturePayload();
+	const payloadPath = await store.create(payload);
+
+	await assert.rejects(
+		store.writeMergeRequest(payloadPath, { ...fixtureRequest(payload), capability: "short" }),
+		/Invalid \/btw merge request/,
+	);
+
+	const oversized = join(dirname(payloadPath), "merge-request.json");
+	await writeFile(oversized, `{"padding":"${"x".repeat(130 * 1024)}"}`, { mode: 0o600 });
+	await assert.rejects(store.readMergeRequest(payloadPath), /oversized/);
+});
+
+test("ContextStore keeps launches with unacknowledged merges and removes acknowledged ones", async (t) => {
+	const { store } = await createFixture(t);
+	const payload = fixturePayload();
+	const payloadPath = await store.create(payload);
+	const request = fixtureRequest(payload);
+
+	// no merge at all -> removed
+	assert.equal(await store.removeIfNoPendingMerge(payloadPath), true);
+	await assert.rejects(access(payloadPath));
+
+	const secondPath = await store.create(payload);
+	await store.writeMergeRequest(secondPath, request);
+	assert.equal(await store.removeIfNoPendingMerge(secondPath), false);
+	await access(secondPath);
+
+	await store.writeMergeAck(secondPath, {
+		protocolVersion: MERGE_PROTOCOL_VERSION,
+		requestId: request.requestId,
+		status: "accepted",
+		processedAt: "2026-07-15T00:01:00.000Z",
+	});
+	assert.equal(await store.removeIfNoPendingMerge(secondPath), true);
+	await assert.rejects(access(secondPath));
+
+	// A stale ack for an earlier request must not allow deleting a newer one.
+	const thirdPath = await store.create(payload);
+	await store.writeMergeRequest(thirdPath, { ...request, requestId: "req-2" });
+	await store.writeMergeAck(thirdPath, {
+		protocolVersion: MERGE_PROTOCOL_VERSION,
+		requestId: "req-1",
+		status: "accepted",
+		processedAt: "2026-07-15T00:02:00.000Z",
+	});
+	assert.equal(await store.removeIfNoPendingMerge(thirdPath), false);
+	await access(thirdPath);
+});
+
+test("ContextStore lists launch payload paths inside the private root", async (t) => {
+	const { store } = await createFixture(t);
+	const first = await store.create(fixturePayload("one"));
+	const second = await store.create(fixturePayload("two"));
+	const listed = await store.listLaunchPayloadPaths();
+	assert.deepEqual(new Set(listed), new Set([first, second]));
 });
 
 test("ContextStore rejects invalid payload contents", async (t) => {

@@ -1,0 +1,242 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import type { BtwPayload } from "../src/core.ts";
+import {
+	buildMergeMessageContent,
+	extractMergeCandidate,
+	hasMergedRequestId,
+	isMergeAck,
+	isMergeRequest,
+	MERGE_CUSTOM_TYPE,
+	MERGE_PROTOCOL_VERSION,
+	MergeCoordinator,
+	validateRequestAgainstPayload,
+	type MergeAck,
+	type MergeRequest,
+	type MergeStorePort,
+	type ParentSessionPort,
+} from "../src/merge.ts";
+import { fixturePayload } from "./fixtures.ts";
+
+function fixtureRequest(payload: BtwPayload, overrides: Partial<MergeRequest> = {}): MergeRequest {
+	return {
+		protocolVersion: MERGE_PROTOCOL_VERSION,
+		requestId: "req-1",
+		launchId: payload.launchId,
+		parentSessionId: payload.parentSessionId,
+		capability: payload.capability,
+		createdAt: "2026-07-15T00:00:00.000Z",
+		summary: "reviewed summary",
+		...overrides,
+	};
+}
+
+test("merge request and ack guards enforce protocol shape and bounds", () => {
+	const payload = fixturePayload();
+	const request = fixtureRequest(payload);
+	assert.equal(isMergeRequest(request), true);
+	assert.equal(isMergeRequest({ ...request, protocolVersion: 2 }), false);
+	assert.equal(isMergeRequest({ ...request, capability: "short" }), false);
+	assert.equal(isMergeRequest({ ...request, summary: "   " }), false);
+	assert.equal(isMergeRequest({ ...request, summary: "x".repeat(64 * 1024 + 1) }), false);
+
+	const ack: MergeAck = {
+		protocolVersion: MERGE_PROTOCOL_VERSION,
+		requestId: "req-1",
+		status: "accepted",
+		processedAt: "2026-07-15T00:01:00.000Z",
+	};
+	assert.equal(isMergeAck(ack), true);
+	assert.equal(isMergeAck({ ...ack, status: "maybe" }), false);
+});
+
+test("merge requests must echo the exact launch identity and session binding", () => {
+	const payload = fixturePayload();
+	assert.equal(validateRequestAgainstPayload(fixtureRequest(payload), payload), undefined);
+	assert.match(
+		validateRequestAgainstPayload(fixtureRequest(payload, { launchId: "other" }), payload) ?? "",
+		/launch ID/,
+	);
+	assert.match(
+		validateRequestAgainstPayload(fixtureRequest(payload, { capability: "0".repeat(64) }), payload) ?? "",
+		/capability/,
+	);
+	assert.match(
+		validateRequestAgainstPayload(
+			fixtureRequest(payload, { parentSessionId: "other-session" }),
+			payload,
+		) ?? "",
+		/session/,
+	);
+});
+
+test("extractMergeCandidate picks the latest text-bearing assistant answer", () => {
+	assert.equal(extractMergeCandidate([]), undefined);
+	const messages = [
+		{ role: "user", content: [{ type: "text", text: "question" }], timestamp: 1 },
+		{ role: "assistant", content: [{ type: "text", text: "first answer" }], timestamp: 2 },
+		{ role: "assistant", content: [{ type: "toolCall", id: "t1" }], timestamp: 3 },
+		{ role: "assistant", content: [{ type: "text", text: "final answer" }], timestamp: 4 },
+		{ role: "user", content: [{ type: "text", text: "thanks" }], timestamp: 5 },
+	] as never[];
+	assert.equal(extractMergeCandidate(messages), "final answer");
+});
+
+test("merge message content wraps the summary in a clear provenance envelope", () => {
+	const content = buildMergeMessageContent("  the summary  ");
+	assert.match(content, /^Merged from \/btw \(reviewed reference material\)/);
+	assert.match(content, /<btw-merge>\nthe summary\n<\/btw-merge>/);
+});
+
+type LaunchState = {
+	payload: BtwPayload;
+	request?: unknown;
+	ack?: MergeAck;
+};
+
+class FakeMergeStore implements MergeStorePort {
+	readonly launches = new Map<string, LaunchState>();
+
+	async listLaunchPayloadPaths(): Promise<string[]> {
+		return [...this.launches.keys()];
+	}
+	async read(payloadPath: string): Promise<BtwPayload> {
+		const launch = this.launches.get(payloadPath);
+		if (!launch) throw new Error("missing payload");
+		return launch.payload;
+	}
+	async readMergeRequest(payloadPath: string): Promise<unknown> {
+		return this.launches.get(payloadPath)?.request;
+	}
+	async readMergeAck(payloadPath: string): Promise<unknown> {
+		return this.launches.get(payloadPath)?.ack;
+	}
+	async writeMergeAck(payloadPath: string, ack: MergeAck): Promise<void> {
+		const launch = this.launches.get(payloadPath);
+		if (!launch) throw new Error("missing launch");
+		launch.ack = ack;
+	}
+}
+
+function fakeSession(sessionId: string) {
+	const sent: Array<{ content: string; details: { requestId: string; launchId: string } }> = [];
+	const notifications: Array<{ message: string; type: string }> = [];
+	const entries: Array<{ type: string; customType?: string; details?: unknown }> = [];
+	let idle = true;
+	const session: ParentSessionPort = {
+		getSessionId: () => sessionId,
+		isIdle: () => idle,
+		getEntries: () => entries,
+		sendMergeMessage: (content, details) => {
+			sent.push({ content, details });
+			entries.push({ type: "custom_message", customType: MERGE_CUSTOM_TYPE, details });
+		},
+		notify: (message, type) => notifications.push({ message, type }),
+	};
+	return { session, sent, notifications, entries, setIdle: (value: boolean) => (idle = value) };
+}
+
+test("coordinator delivers a valid merge exactly once and acknowledges it", async () => {
+	const payload = fixturePayload();
+	const store = new FakeMergeStore();
+	store.launches.set("/launch/payload.json", { payload, request: fixtureRequest(payload) });
+	const { session, sent } = fakeSession(payload.parentSessionId);
+	const coordinator = new MergeCoordinator(store, session);
+
+	const first = await coordinator.scan();
+	assert.deepEqual(first, { delivered: 1, deferred: 0, rejected: 0 });
+	assert.equal(sent.length, 1);
+	assert.match(sent[0]?.content ?? "", /reviewed summary/);
+	assert.equal(store.launches.get("/launch/payload.json")?.ack?.status, "accepted");
+
+	// acked requests are never re-delivered
+	const second = await coordinator.scan();
+	assert.deepEqual(second, { delivered: 0, deferred: 0, rejected: 0 });
+	assert.equal(sent.length, 1);
+});
+
+test("a second merge is delivered even when a stale ack from the first remains", async () => {
+	const payload = fixturePayload();
+	const store = new FakeMergeStore();
+	const launch: LaunchState = { payload, request: fixtureRequest(payload, { requestId: "req-1" }) };
+	store.launches.set("/launch/payload.json", launch);
+	const { session, sent } = fakeSession(payload.parentSessionId);
+	const coordinator = new MergeCoordinator(store, session);
+
+	assert.deepEqual(await coordinator.scan(), { delivered: 1, deferred: 0, rejected: 0 });
+	assert.equal(launch.ack?.requestId, "req-1");
+
+	// Child publishes a second merge; the old ack must not mask it.
+	launch.request = fixtureRequest(payload, { requestId: "req-2", summary: "second summary" });
+	assert.deepEqual(await coordinator.scan(), { delivered: 1, deferred: 0, rejected: 0 });
+	assert.equal(sent.length, 2);
+	assert.match(sent[1]?.content ?? "", /second summary/);
+	assert.equal(launch.ack?.requestId, "req-2");
+
+	// And the matching ack now stops re-delivery.
+	assert.deepEqual(await coordinator.scan(), { delivered: 0, deferred: 0, rejected: 0 });
+	assert.equal(sent.length, 2);
+});
+
+test("coordinator defers while the parent is busy and delivers after it settles", async () => {
+	const payload = fixturePayload();
+	const store = new FakeMergeStore();
+	store.launches.set("/launch/payload.json", { payload, request: fixtureRequest(payload) });
+	const { session, sent, setIdle } = fakeSession(payload.parentSessionId);
+	const coordinator = new MergeCoordinator(store, session);
+
+	setIdle(false);
+	assert.deepEqual(await coordinator.scan(), { delivered: 0, deferred: 1, rejected: 0 });
+	assert.equal(sent.length, 0);
+	assert.equal(store.launches.get("/launch/payload.json")?.ack, undefined);
+
+	setIdle(true);
+	assert.deepEqual(await coordinator.scan(), { delivered: 1, deferred: 0, rejected: 0 });
+	assert.equal(sent.length, 1);
+});
+
+test("coordinator ignores merges bound to other sessions", async () => {
+	const payload = fixturePayload();
+	const store = new FakeMergeStore();
+	store.launches.set("/launch/payload.json", { payload, request: fixtureRequest(payload) });
+	const { session, sent } = fakeSession("another-session-id");
+	const coordinator = new MergeCoordinator(store, session);
+
+	assert.deepEqual(await coordinator.scan(), { delivered: 0, deferred: 0, rejected: 0 });
+	assert.equal(sent.length, 0);
+	assert.equal(store.launches.get("/launch/payload.json")?.ack, undefined);
+});
+
+test("coordinator rejects forged or malformed merge requests", async () => {
+	const payload = fixturePayload();
+	const store = new FakeMergeStore();
+	store.launches.set("/forged/payload.json", {
+		payload,
+		request: fixtureRequest(payload, { capability: "f".repeat(64) }),
+	});
+	store.launches.set("/malformed/payload.json", { payload, request: { nonsense: true } });
+	const { session, sent, notifications } = fakeSession(payload.parentSessionId);
+	const coordinator = new MergeCoordinator(store, session);
+
+	assert.deepEqual(await coordinator.scan(), { delivered: 0, deferred: 0, rejected: 2 });
+	assert.equal(sent.length, 0);
+	assert.equal(store.launches.get("/forged/payload.json")?.ack?.status, "rejected");
+	assert.equal(store.launches.get("/malformed/payload.json")?.ack?.status, "rejected");
+	assert.equal(notifications.filter((n) => n.type === "warning").length, 2);
+});
+
+test("coordinator re-acks without re-appending after an append-succeeded/ack-failed crash", async () => {
+	const payload = fixturePayload();
+	const request = fixtureRequest(payload);
+	const store = new FakeMergeStore();
+	store.launches.set("/launch/payload.json", { payload, request });
+	const { session, sent, entries } = fakeSession(payload.parentSessionId);
+	// Simulate a previous append that persisted before the ack write crashed.
+	entries.push({ type: "custom_message", customType: MERGE_CUSTOM_TYPE, details: { requestId: request.requestId } });
+	const coordinator = new MergeCoordinator(store, session);
+
+	assert.deepEqual(await coordinator.scan(), { delivered: 0, deferred: 0, rejected: 0 });
+	assert.equal(sent.length, 0);
+	assert.equal(store.launches.get("/launch/payload.json")?.ack?.status, "accepted");
+	assert.equal(hasMergedRequestId(entries, request.requestId), true);
+});
