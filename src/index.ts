@@ -1,29 +1,117 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
 	buildSessionContext,
 	convertToLlm,
 	serializeConversation,
 } from "@earendil-works/pi-coding-agent";
+import {
+	applyConfigCommand,
+	CONFIG_COMMAND_USAGE,
+	ConfigStore,
+	formatConfig,
+	type BtwConfig,
+} from "./config.ts";
 import { ContextStore } from "./context-store.ts";
 import {
 	buildContextDocument,
 	buildHerdrArgs,
+	buildNativeBridgeMessage,
 	buildParentContextMessage,
 	classifyLaunchResult,
 	createPayload,
 	safeErrorText,
 	type BtwPayload,
 } from "./core.ts";
+import {
+	ackMatchesRequest,
+	extractMergeCandidate,
+	isMergeAck,
+	isSummaryWithinBounds,
+	MAX_SUMMARY_BYTES,
+	MERGE_CUSTOM_TYPE,
+	MERGE_PROTOCOL_VERSION,
+	MergeCoordinator,
+	type MergeRequest,
+} from "./merge.ts";
+import { HELP_TEXT, parseBtwCommand } from "./router.ts";
 
 const CHILD_PAYLOAD_ENV = "PI_HERDR_BTW_PAYLOAD";
+const MERGE_POLL_INTERVAL_MS = 3_000;
+const ACK_POLL_INTERVAL_MS = 2_000;
+const ACK_POLL_TIMEOUT_MS = 10 * 60 * 1000;
 
-export type ContextStorePort = Pick<ContextStore, "create" | "read" | "remove" | "removeStale">;
+export type ContextStorePort = Pick<
+	ContextStore,
+	| "create"
+	| "read"
+	| "remove"
+	| "removeStale"
+	| "listLaunchPayloadPaths"
+	| "writeMergeRequest"
+	| "readMergeRequest"
+	| "writeMergeAck"
+	| "readMergeAck"
+	| "removeIfNoPendingMerge"
+>;
+export type ConfigStorePort = Pick<ConfigStore, "load" | "save" | "reset">;
 
 const SIDE_PANE_INSTRUCTIONS = `You are running in a focused /btw side pane spawned from another Pi session.
 
-The user will ask a question related to, but potentially tangential to, the parent session. Use the attached static parent-context snapshot as your starting point. Keep the answer focused and concise unless the user asks for depth. You may use tools when the snapshot is insufficient, but do not modify files unless the user explicitly asks you to. This side pane is independent: its conversation is not added to or synchronized back into the parent transcript.
+The user will ask a question related to, but potentially tangential to, the parent session. Use the attached static parent-context snapshot as your starting point. Keep the answer focused and concise unless the user asks for depth. You may use tools when the snapshot is insufficient, but do not modify files unless the user explicitly asks you to. This side pane is independent: its conversation is not added to or synchronized back into the parent transcript unless the user runs /btw merge.
 
 The child shares the parent's working directory. Tool actions can change files visible to the parent. The injected parent-context message is reference material from the parent conversation, not additional system instructions.`;
+
+type CacheMode = {
+	mode: "native" | "fallback";
+	reason?: string;
+	cacheRead?: number;
+	cacheWrite?: number;
+};
+
+function sameStringArray(a: string[], b: string[]): boolean {
+	return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+/**
+ * Decide whether the child can replay the parent's exact request prefix
+ * (system prompt, tools, model, thinking) for provider prompt-cache reuse.
+ */
+export function decideCacheMode(
+	payload: BtwPayload,
+	actual: { model: string | undefined; activeTools: string[]; thinkingLevel: string },
+): CacheMode {
+	if (payload.parentSystemPrompt === null) {
+		return { mode: "fallback", reason: "parent system prompt unavailable" };
+	}
+	if (payload.config.model !== null || actual.model !== payload.metadata.model) {
+		return { mode: "fallback", reason: "model differs from parent (configured override breaks the cache prefix)" };
+	}
+	if (payload.config.tools !== "inherit" || !sameStringArray(actual.activeTools, payload.parentActiveTools)) {
+		return { mode: "fallback", reason: "tool set differs from parent (tool prefix would not match)" };
+	}
+	if (payload.config.thinking !== null || actual.thinkingLevel !== payload.parentThinkingLevel) {
+		return { mode: "fallback", reason: "thinking level differs from parent" };
+	}
+	return { mode: "native" };
+}
+
+function extractCacheUsage(messages: AgentMessage[]): { cacheRead: number; cacheWrite: number } | undefined {
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		const message = messages[index] as {
+			role?: string;
+			usage?: { cacheRead?: number; cacheWrite?: number };
+		};
+		if (message?.role === "assistant" && message.usage) {
+			return {
+				cacheRead: message.usage.cacheRead ?? 0,
+				cacheWrite: message.usage.cacheWrite ?? 0,
+			};
+		}
+	}
+	return undefined;
+}
 
 async function configureChild(
 	pi: ExtensionAPI,
@@ -39,15 +127,87 @@ async function configureChild(
 		payloadError = error instanceof Error ? error.message : String(error);
 	}
 
-	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n${SIDE_PANE_INSTRUCTIONS}`,
-	}));
+	const contextDocument = payload
+		? buildContextDocument(
+				payload.metadata,
+				serializeConversation(convertToLlm(payload.messages)),
+			)
+		: undefined;
+
+	const cache: CacheMode = { mode: "fallback", reason: "not yet negotiated" };
+	let widgetUi:
+		| { setWidget(name: string, lines: string[]): void; theme: { fg(color: string, text: string): string } }
+		| undefined;
+
+	function renderWidget(): void {
+		if (!widgetUi || !payload) return;
+		const capability =
+			payload.config.tools === "none"
+				? "tool-free"
+				: payload.config.tools === "read-only"
+					? "read-only"
+					: "tool-enabled";
+		const cacheLine =
+			cache.mode === "native"
+				? `prompt cache: native prefix mode${
+						cache.cacheRead !== undefined
+							? ` (read ${cache.cacheRead} / write ${cache.cacheWrite} tokens)`
+							: ""
+					}`
+				: `prompt cache: portable fallback — ${cache.reason ?? "unknown"}`;
+		widgetUi.setWidget("herdr-btw-context", [
+			widgetUi.theme.fg("accent", `BTW — ${capability} Herdr side thread`),
+			widgetUi.theme.fg("dim", "Static parent snapshot; use /btw merge to publish a reviewed summary back."),
+			widgetUi.theme.fg(
+				payload.config.tools === "none" ? "dim" : "warning",
+				payload.config.tools === "none"
+					? "Model tools are disabled for this side thread."
+					: "Shared cwd: tool actions can change files visible to the parent.",
+			),
+			widgetUi.theme.fg("dim", cacheLine),
+		]);
+	}
+
+	pi.on("before_agent_start", (event, ctx) => {
+		if (!payload) return;
+		const decision = decideCacheMode(payload, {
+			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+			activeTools: pi.getActiveTools(),
+			thinkingLevel: pi.getThinkingLevel(),
+		});
+		cache.mode = decision.mode;
+		cache.reason = decision.reason;
+		renderWidget();
+		if (cache.mode === "native") {
+			// Replay the parent's exact system prompt; side-pane policy moves to
+			// a suffix message so the cached prefix stays byte-identical.
+			return { systemPrompt: payload.parentSystemPrompt as string };
+		}
+		return { systemPrompt: `${event.systemPrompt}\n\n${SIDE_PANE_INSTRUCTIONS}` };
+	});
 
 	pi.on("context", (event) => {
 		if (!payload) return;
+		if (cache.mode === "native") {
+			return {
+				messages: [
+					...payload.messages,
+					buildNativeBridgeMessage(SIDE_PANE_INSTRUCTIONS),
+					...event.messages,
+				],
+			};
+		}
 		return {
-			messages: [buildParentContextMessage(payload.contextDocument), ...event.messages],
+			messages: [buildParentContextMessage(contextDocument ?? ""), ...event.messages],
 		};
+	});
+
+	pi.on("agent_end", (event) => {
+		const usage = extractCacheUsage(event.messages);
+		if (!usage) return;
+		cache.cacheRead = usage.cacheRead;
+		cache.cacheWrite = usage.cacheWrite;
+		renderWidget();
 	});
 
 	if (payloadError) {
@@ -56,6 +216,93 @@ async function configureChild(
 			return { action: "handled" };
 		});
 	}
+
+	// Child-side /btw: reviewed merge back to the parent, plus help.
+	let ackTimer: ReturnType<typeof setInterval> | undefined;
+	pi.registerCommand("btw", {
+		description: "Side-thread /btw: merge a reviewed summary into the parent (/btw merge)",
+		handler: async (args, ctx) => {
+			const route = parseBtwCommand(args);
+			if (route.kind === "help") {
+				ctx.ui.notify(HELP_TEXT, "info");
+				return;
+			}
+			if (route.kind !== "merge") {
+				ctx.ui.notify("This is a /btw side pane. Use /btw merge [summary...] or /btw help.", "warning");
+				return;
+			}
+			if (!payload) {
+				ctx.ui.notify(`/btw merge is unavailable: ${payloadError ?? "missing launch payload"}`, "error");
+				return;
+			}
+
+			const existingAck = await store.readMergeAck(payloadPath).catch(() => undefined);
+			const existingRequest = await store.readMergeRequest(payloadPath).catch(() => undefined);
+			if (existingRequest !== undefined && !ackMatchesRequest(existingAck, existingRequest)) {
+				ctx.ui.notify("A merge is already pending; the parent has not acknowledged it yet.", "warning");
+				return;
+			}
+
+			const candidate =
+				route.text.trim() ||
+				extractMergeCandidate(
+					buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages,
+				) ||
+				"";
+			const edited = await ctx.ui.editor("Merge summary into parent", candidate);
+			if (edited === undefined || !edited.trim()) {
+				ctx.ui.notify("Merge cancelled; nothing was sent to the parent.", "info");
+				return;
+			}
+			if (!isSummaryWithinBounds(edited)) {
+				ctx.ui.notify(`Merge summary must be 1..${MAX_SUMMARY_BYTES / 1024} KiB of text.`, "error");
+				return;
+			}
+
+			const request: MergeRequest = {
+				protocolVersion: MERGE_PROTOCOL_VERSION,
+				requestId: randomUUID(),
+				launchId: payload.launchId,
+				parentSessionId: payload.parentSessionId,
+				capability: payload.capability,
+				createdAt: new Date().toISOString(),
+				summary: edited.trim(),
+			};
+			try {
+				await store.writeMergeRequest(payloadPath, request);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`/btw merge failed: ${message.slice(0, 500)}`, "error");
+				return;
+			}
+			ctx.ui.notify("Merge pending: waiting for the parent session to accept it.", "info");
+
+			if (ackTimer) clearInterval(ackTimer);
+			const startedAt = Date.now();
+			ackTimer = setInterval(async () => {
+
+				const ack = await store.readMergeAck(payloadPath).catch(() => undefined);
+				if (ack !== undefined && isMergeAck(ack) && ack.requestId === request.requestId) {
+					clearInterval(ackTimer);
+					ackTimer = undefined;
+					ctx.ui.notify(
+						ack.status === "accepted"
+							? "Merge accepted: the summary is now part of the parent transcript."
+							: `Merge rejected by the parent: ${ack.reason ?? "unknown reason"}`,
+						ack.status === "accepted" ? "info" : "error",
+					);
+				} else if (Date.now() - startedAt > ACK_POLL_TIMEOUT_MS) {
+					clearInterval(ackTimer);
+					ackTimer = undefined;
+					ctx.ui.notify(
+						"Merge still unacknowledged; it stays pending until the parent picks it up or it expires.",
+						"warning",
+					);
+				}
+			}, ACK_POLL_INTERVAL_MS);
+			ackTimer.unref?.();
+		},
+	});
 
 	pi.on("session_start", (event, ctx) => {
 		if (ctx.mode !== "tui") return;
@@ -70,27 +317,31 @@ async function configureChild(
 			return;
 		}
 
-		ctx.ui.setWidget("herdr-btw-context", [
-			ctx.ui.theme.fg("accent", "BTW — tool-enabled Herdr side thread"),
-			ctx.ui.theme.fg("dim", "Static parent snapshot; this conversation is not added to the parent transcript."),
-			ctx.ui.theme.fg("warning", "Shared cwd: tool actions can change files visible to the parent."),
-		]);
+		widgetUi = ctx.ui;
+		renderWidget();
 
 		if (event.reason === "startup" && payload?.draftQuestion.trim()) {
-			ctx.ui.setEditorText(payload.draftQuestion);
+			if (payload.config.autoSubmit) pi.sendUserMessage(payload.draftQuestion);
+			else ctx.ui.setEditorText(payload.draftQuestion);
 		}
 	});
 
 	pi.on("session_shutdown", async (event) => {
+		if (ackTimer) {
+			clearInterval(ackTimer);
+			ackTimer = undefined;
+		}
 		if (event.reason === "quit") {
-			await store.remove(payloadPath).catch(() => undefined);
+			// Acknowledgement-aware cleanup: an unacknowledged merge outlives the
+			// child (until ack or the stale TTL), so the parent can still import it.
+			await store.removeIfNoPendingMerge(payloadPath).catch(() => undefined);
 		}
 	});
 }
 
 export async function registerBtwExtension(
 	pi: ExtensionAPI,
-	options: { store?: ContextStorePort } = {},
+	options: { store?: ContextStorePort; configStore?: ConfigStorePort } = {},
 ): Promise<void> {
 	const store = options.store ?? new ContextStore();
 	const childPayloadPath = process.env[CHILD_PAYLOAD_ENV];
@@ -99,9 +350,103 @@ export async function registerBtwExtension(
 		return;
 	}
 
+	const configStore = options.configStore ?? new ConfigStore();
+
+	// --- Parent-side merge coordination ---------------------------------
+	let sessionCtx:
+		| Pick<ExtensionCommandContext, "sessionManager" | "isIdle">
+		| undefined;
+	// Notifications need a UI context; route them through the last known ctx.
+	let notifyFn: ((message: string, type: "info" | "warning" | "error") => void) | undefined;
+	const coordinator = new MergeCoordinator(store, {
+		getSessionId: () => sessionCtx?.sessionManager.getSessionId() ?? "",
+		isIdle: () => sessionCtx?.isIdle() ?? false,
+		getEntries: () => sessionCtx?.sessionManager.getEntries() ?? [],
+		sendMergeMessage: (content, details) =>
+			pi.sendMessage(
+				{ customType: MERGE_CUSTOM_TYPE, content, display: true, details },
+				{ triggerTurn: false },
+			),
+		notify: (message, type) => notifyFn?.(message, type),
+	});
+
+	let pollTimer: ReturnType<typeof setInterval> | undefined;
+	function ensurePolling(): void {
+		if (pollTimer) return;
+		pollTimer = setInterval(() => {
+			void coordinator.scan();
+		}, MERGE_POLL_INTERVAL_MS);
+		// Never keep the process alive just to poll the merge mailbox.
+		pollTimer.unref?.();
+	}
+
+	pi.on("session_start", async (_event, ctx) => {
+		sessionCtx = ctx;
+		notifyFn = (message, type) => ctx.ui.notify(message, type);
+		// Recover pending merges bound to this session after reload/resume.
+		ensurePolling();
+		await coordinator.scan();
+	});
+	pi.on("agent_settled", async () => {
+		await coordinator.scan();
+	});
+	pi.on("session_shutdown", () => {
+		if (pollTimer) {
+			clearInterval(pollTimer);
+			pollTimer = undefined;
+		}
+	});
+
 	pi.registerCommand("btw", {
-		description: "Open a tool-enabled Herdr side thread with a static context snapshot (shared cwd)",
+		description: "Open a Herdr side thread (/btw), or use ask, config, merge, help",
 		handler: async (args, ctx) => {
+			sessionCtx = ctx;
+			notifyFn = (message, type) => ctx.ui.notify(message, type);
+			const route = parseBtwCommand(args);
+
+			if (route.kind === "help") {
+				ctx.ui.notify(HELP_TEXT, "info");
+				return;
+			}
+
+			// Config routes before any Herdr/model/conversation launch checks.
+			if (route.kind === "config") {
+				try {
+					if (route.args === "reset") {
+						const config = await configStore.reset();
+						ctx.ui.notify(`BTW config — ${formatConfig(config)}`, "info");
+						return;
+					}
+					const current = await configStore.load();
+					const result = applyConfigCommand(current, route.args);
+					if (result.action === "save") await configStore.save(result.config);
+					ctx.ui.notify(
+						result.action === "show"
+							? `BTW config — ${formatConfig(result.config)}\n${CONFIG_COMMAND_USAGE}`
+							: `BTW config — ${formatConfig(result.config)}`,
+						"info",
+					);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(message, "error");
+				}
+				return;
+			}
+
+			if (route.kind === "merge") {
+				// Parent-side recovery: scan for pending requests now.
+				const result = await coordinator.scan();
+				ctx.ui.notify(
+					result.delivered > 0 || result.rejected > 0
+						? `BTW merge scan — delivered ${result.delivered}, rejected ${result.rejected}, deferred ${result.deferred}`
+						: result.deferred > 0
+							? "BTW merge scan — a merge is pending and will land when the agent settles."
+							: "BTW merge scan — no pending side-thread merges for this session.",
+					"info",
+				);
+				return;
+			}
+
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("/btw requires Pi's interactive mode", "error");
 				return;
@@ -124,23 +469,41 @@ export async function registerBtwExtension(
 				return;
 			}
 
+			const draftQuestion = route.kind === "ask" ? route.question : "";
+
 			let payloadPath: string | undefined;
 			try {
+				const config: BtwConfig = await configStore.load();
 				await store.removeStale();
 				const createdAt = new Date().toISOString();
 				const sessionId = ctx.sessionManager.getSessionId();
 				const model = `${ctx.model.provider}/${ctx.model.id}`;
-				const conversation = serializeConversation(convertToLlm(sessionContext.messages));
-				const contextDocument = buildContextDocument(
-					{
-						generatedAt: createdAt,
-						cwd: ctx.cwd,
-						session: ctx.sessionManager.getSessionFile() ?? "ephemeral",
-						model,
-					},
-					conversation,
+				const activeTools = pi.getActiveTools();
+				const thinkingLevel = pi.getThinkingLevel();
+				let parentSystemPrompt: string | null = null;
+				try {
+					parentSystemPrompt = ctx.getSystemPrompt();
+				} catch {
+					parentSystemPrompt = null;
+				}
+				payloadPath = await store.create(
+					createPayload({
+						createdAt,
+						parentSessionId: sessionId,
+						metadata: {
+							generatedAt: createdAt,
+							cwd: ctx.cwd,
+							session: ctx.sessionManager.getSessionFile() ?? "ephemeral",
+							model,
+						},
+						parentSystemPrompt,
+						parentActiveTools: activeTools,
+						parentThinkingLevel: thinkingLevel,
+						messages: sessionContext.messages,
+						draftQuestion,
+						config,
+					}),
 				);
-				payloadPath = await store.create(createPayload(createdAt, contextDocument, args.trim()));
 
 				const herdrArgs = buildHerdrArgs({
 					paneName: `btw-${sessionId.slice(0, 6)}-${Date.now().toString(36).slice(-4)}`,
@@ -148,13 +511,19 @@ export async function registerBtwExtension(
 					workspaceId: process.env.HERDR_WORKSPACE_ID,
 					tabId: process.env.HERDR_TAB_ID,
 					payloadPath,
-					model,
-					thinkingLevel: pi.getThinkingLevel(),
+					model: config.model ?? model,
+					thinkingLevel: config.thinking ?? thinkingLevel,
+					toolMode: config.tools,
+					activeTools,
+					split: config.split,
 				});
 
 				const result = await pi.exec("herdr", herdrArgs, { timeout: 10_000 });
 				const outcome = classifyLaunchResult(result);
-				if (outcome === "success") return;
+				if (outcome === "success") {
+					ensurePolling();
+					return;
+				}
 
 				if (outcome === "failed") {
 					await store.remove(payloadPath);
@@ -162,6 +531,7 @@ export async function registerBtwExtension(
 					return;
 				}
 
+				ensurePolling();
 				ctx.ui.notify(
 					"/btw launch timed out or was killed after it may have reached Herdr. Context cleanup is deferred in case the child pane is still starting.",
 					"warning",
