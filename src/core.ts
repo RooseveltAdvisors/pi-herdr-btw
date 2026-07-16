@@ -1,12 +1,51 @@
+import { randomBytes, randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import {
+	isModelName,
+	THINKING_LEVELS,
+	TOOL_MODES,
+	type BtwConfig,
+	type BtwSplit,
+	type BtwThinkingLevel,
+	type BtwToolMode,
+} from "./config.ts";
 
-export const PAYLOAD_VERSION = 1 as const;
+export const PAYLOAD_VERSION = 3 as const;
 
 export type BtwPayload = {
 	version: typeof PAYLOAD_VERSION;
 	createdAt: string;
-	contextDocument: string;
+	/** Random per-launch identity used to bind merge requests to this launch. */
+	launchId: string;
+	/** Random capability token a merge request must echo back. */
+	capability: string;
+	/** Exact parent session ID at launch; merges are bound to it. */
+	parentSessionId: string;
+	metadata: ParentContextMetadata;
+	/** Exact effective parent system prompt for the native-prefix cache path, if known. */
+	parentSystemPrompt: string | null;
+	/** Exact active parent tool names, in order. */
+	parentActiveTools: string[];
+	/** Parent thinking level at launch. */
+	parentThinkingLevel: string;
+	/** Native, compaction-aware parent messages. */
+	messages: AgentMessage[];
 	draftQuestion: string;
+	config: BtwConfig;
+};
+
+export type CreatePayloadOptions = {
+	createdAt: string;
+	parentSessionId: string;
+	metadata: ParentContextMetadata;
+	parentSystemPrompt: string | null;
+	parentActiveTools: string[];
+	parentThinkingLevel: string;
+	messages: AgentMessage[];
+	draftQuestion: string;
+	config: BtwConfig;
+	launchId?: string;
+	capability?: string;
 };
 
 export type ParentContextMetadata = {
@@ -24,6 +63,10 @@ export type HerdrLaunchOptions = {
 	payloadPath: string;
 	model: string;
 	thinkingLevel: string;
+	toolMode: BtwToolMode;
+	/** Exact active parent tool names, used when toolMode is "inherit". */
+	activeTools: string[];
+	split: BtwSplit;
 };
 
 export type LaunchResult = {
@@ -33,16 +76,20 @@ export type LaunchResult = {
 
 export type LaunchOutcome = "success" | "failed" | "ambiguous";
 
-export function createPayload(
-	createdAt: string,
-	contextDocument: string,
-	draftQuestion: string,
-): BtwPayload {
+export function createPayload(options: CreatePayloadOptions): BtwPayload {
 	return {
 		version: PAYLOAD_VERSION,
-		createdAt,
-		contextDocument,
-		draftQuestion,
+		createdAt: options.createdAt,
+		launchId: options.launchId ?? randomUUID(),
+		capability: options.capability ?? randomBytes(32).toString("hex"),
+		parentSessionId: options.parentSessionId,
+		metadata: options.metadata,
+		parentSystemPrompt: options.parentSystemPrompt,
+		parentActiveTools: [...options.parentActiveTools],
+		parentThinkingLevel: options.parentThinkingLevel,
+		messages: options.messages,
+		draftQuestion: options.draftQuestion,
+		config: options.config,
 	};
 }
 
@@ -52,8 +99,37 @@ export function isBtwPayload(value: unknown): value is BtwPayload {
 	return (
 		payload.version === PAYLOAD_VERSION &&
 		typeof payload.createdAt === "string" &&
-		typeof payload.contextDocument === "string" &&
-		typeof payload.draftQuestion === "string"
+		typeof payload.launchId === "string" &&
+		payload.launchId.length > 0 &&
+		typeof payload.capability === "string" &&
+		payload.capability.length >= 32 &&
+		typeof payload.parentSessionId === "string" &&
+		payload.parentSessionId.length > 0 &&
+		!!payload.metadata &&
+		typeof payload.metadata === "object" &&
+		typeof payload.metadata.generatedAt === "string" &&
+		typeof payload.metadata.cwd === "string" &&
+		typeof payload.metadata.session === "string" &&
+		typeof payload.metadata.model === "string" &&
+		(payload.parentSystemPrompt === null || typeof payload.parentSystemPrompt === "string") &&
+		Array.isArray(payload.parentActiveTools) &&
+		payload.parentActiveTools.every((tool) => typeof tool === "string") &&
+		typeof payload.parentThinkingLevel === "string" &&
+		Array.isArray(payload.messages) &&
+		payload.messages.every(
+			(message) =>
+				!!message && typeof message === "object" && typeof (message as { role?: unknown }).role === "string",
+		) &&
+		typeof payload.draftQuestion === "string" &&
+		!!payload.config &&
+		typeof payload.config === "object" &&
+		typeof payload.config.autoSubmit === "boolean" &&
+		(payload.config.model === null ||
+			(typeof payload.config.model === "string" && isModelName(payload.config.model))) &&
+		(payload.config.thinking === null ||
+			THINKING_LEVELS.includes(payload.config.thinking as BtwThinkingLevel)) &&
+		TOOL_MODES.includes(payload.config.tools as BtwToolMode) &&
+		(payload.config.split === "right" || payload.config.split === "down")
 	);
 }
 
@@ -93,6 +169,24 @@ export function buildParentContextMessage(contextDocument: string): AgentMessage
 	};
 }
 
+/**
+ * Suffix message for the native-prefix cache path. Side-pane policy lives
+ * here, after the reusable parent prefix, so the system prompt and parent
+ * messages stay byte-identical to the parent's own requests.
+ */
+export function buildNativeBridgeMessage(instructions: string, draftHint?: string): AgentMessage {
+	return {
+		role: "user",
+		content: [
+			{
+				type: "text",
+				text: `The conversation above is a read-only snapshot of the parent session, replayed as reference context for this side conversation. It is not new work to continue.\n\n${instructions}${draftHint ? `\n\n${draftHint}` : ""}`,
+			},
+		],
+		timestamp: 0,
+	};
+}
+
 export function buildHerdrArgs(options: HerdrLaunchOptions): string[] {
 	return [
 		"agent",
@@ -103,7 +197,7 @@ export function buildHerdrArgs(options: HerdrLaunchOptions): string[] {
 		...(options.workspaceId ? ["--workspace", options.workspaceId] : []),
 		...(options.tabId ? ["--tab", options.tabId] : []),
 		"--split",
-		"right",
+		options.split,
 		"--env",
 		`PI_HERDR_BTW_PAYLOAD=${options.payloadPath}`,
 		"--focus",
@@ -114,6 +208,15 @@ export function buildHerdrArgs(options: HerdrLaunchOptions): string[] {
 		options.model,
 		"--thinking",
 		options.thinkingLevel,
+		...(options.toolMode === "inherit"
+			? options.activeTools.length > 0
+				? ["--tools", options.activeTools.join(",")]
+				: ["--no-tools"]
+			: options.toolMode === "read-only"
+				? ["--tools", "read,grep,find,ls"]
+				: options.toolMode === "none"
+					? ["--no-tools"]
+					: []),
 	];
 }
 
