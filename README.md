@@ -1,8 +1,8 @@
 # pi-herdr-btw
 
-A [Pi](https://pi.dev/) extension inspired by [Claude Code's `/btw`](https://code.claude.com/docs/en/interactive-mode#side-questions-with-/btw). It opens a tool-enabled side conversation in a focused [Herdr](https://github.com/ogulcancelik/herdr) pane without changing the parent transcript.
+A [Pi](https://github.com/earendil-works/pi) extension inspired by [Claude Code's `/btw`](https://code.claude.com/docs/en/interactive-mode#side-questions-with-/btw). It opens a tool-enabled side conversation in a focused [Herdr](https://github.com/ogulcancelik/herdr) pane without changing the parent transcript.
 
-Unlike Claude Code's one-shot, tool-free overlay, this side thread runs in a separate Pi process and supports editing the initial question, tools, and follow-ups.
+Unlike Claude Code's one-shot, tool-free overlay, this side thread runs in a separate Pi process and supports editing the initial question, tools, and follow-ups, as well as merding the side thread back into the main one with a summary.
 
 ## Behavior
 
