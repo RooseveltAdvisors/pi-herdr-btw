@@ -20,6 +20,8 @@ import {
 	buildParentContextMessage,
 	classifyLaunchResult,
 	createPayload,
+	LAUNCH_DRAFT_ARG,
+	LAUNCH_DRAFT_COMMAND,
 	safeErrorText,
 	type BtwPayload,
 } from "./core.ts";
@@ -173,11 +175,24 @@ async function configureChild(
 		});
 	}
 
+	// One-shot launch-draft submit, armed only for auto-submit payloads. The
+	// parent delivers `/btw --launch-draft` as pi's initial message, which pi
+	// processes after its initial render — sending from session_start instead
+	// races the TUI startup and paints the question twice.
+	let launchDraftPending = !!(payload?.config.autoSubmit && payload.draftQuestion.trim());
+
 	// Child-side /btw: reviewed merge back to the parent, plus help.
 	let ackTimer: ReturnType<typeof setInterval> | undefined;
 	pi.registerCommand("btw", {
 		description: "Side-thread /btw: merge a reviewed summary into the parent (/btw merge)",
 		handler: async (args, ctx) => {
+			if (args.trim() === LAUNCH_DRAFT_ARG) {
+				if (launchDraftPending && payload) {
+					launchDraftPending = false;
+					pi.sendUserMessage(payload.draftQuestion);
+				}
+				return;
+			}
 			const route = parseBtwCommand(args);
 			if (route.kind === "help") {
 				ctx.ui.notify(HELP_TEXT, "info");
@@ -276,9 +291,11 @@ async function configureChild(
 		widgetUi = ctx.ui;
 		renderWidget();
 
-		if (event.reason === "startup" && payload?.draftQuestion.trim()) {
-			if (payload.config.autoSubmit) pi.sendUserMessage(payload.draftQuestion);
-			else ctx.ui.setEditorText(payload.draftQuestion);
+		// Auto-submit drafts are sent via the launch-draft sentinel instead of
+		// here: session_start fires before pi's initial render, and a message
+		// sent from it is painted twice.
+		if (event.reason === "startup" && payload?.draftQuestion.trim() && !payload.config.autoSubmit) {
+			ctx.ui.setEditorText(payload.draftQuestion);
 		}
 	});
 
@@ -472,6 +489,11 @@ export async function registerBtwExtension(
 					toolMode: config.tools,
 					activeTools,
 					split: config.split,
+					// Auto-submitted drafts go through pi's initial-message path
+					// (processed after initial render) to avoid the double-paint
+					// startup race; only this sentinel hits argv, never the question.
+					initialMessage:
+						config.autoSubmit && draftQuestion.trim() ? LAUNCH_DRAFT_COMMAND : undefined,
 				});
 
 				const result = await pi.exec("herdr", herdrArgs, { timeout: 10_000 });

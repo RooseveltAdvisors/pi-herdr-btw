@@ -100,6 +100,26 @@ test("buildHerdrArgs omits unavailable workspace and tab identifiers", () => {
 	assert.equal(args.at(-1), "--no-tools");
 });
 
+test("buildHerdrArgs appends the launch-draft sentinel as the child's initial message", () => {
+	const options = {
+		paneName: "btw-abc123",
+		cwd: "/tmp/project",
+		payloadPath: "/tmp/payload.json",
+		model: "provider/model",
+		thinkingLevel: "high",
+		toolMode: "none" as const,
+		activeTools: [],
+		split: "right" as const,
+	};
+	// The sentinel must be the final positional argument, after every flag,
+	// so pi treats it as the initial message processed after initial render.
+	const args = buildHerdrArgs({ ...options, initialMessage: "/btw --launch-draft" });
+	assert.equal(args.at(-1), "/btw --launch-draft");
+	assert.equal(args.at(-2), "--no-tools");
+	// Without an initial message nothing is appended.
+	assert.equal(buildHerdrArgs(options).at(-1), "--no-tools");
+});
+
 test("buildHerdrArgs passes the exact parent tool set for inherit mode", () => {
 	const options = {
 		paneName: "btw-abc123",

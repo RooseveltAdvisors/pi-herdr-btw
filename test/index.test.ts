@@ -417,7 +417,41 @@ test("parent command applies configured model, thinking, tools, and split", asyn
 			"--split",
 			"down",
 		]);
-		assert.equal(args.at(-1), "--no-tools");
+		// autoSubmit launches carry the launch-draft sentinel as pi's initial
+		// message so the child submits the draft after initial render (avoids
+		// the double-paint startup race); the question itself never hits argv.
+		assert.equal(args.at(-1), "/btw --launch-draft");
+		assert.equal(args.at(-2), "--no-tools");
+		assert.equal(args.some((arg) => arg.includes("question")), false);
+	});
+});
+
+test("parent omits the launch-draft sentinel when auto-submit is off or there is no draft", async () => {
+	await withParentEnvironment(async () => {
+		const store = new FakeStore();
+		const configStore = new FakeConfigStore();
+		const harness = await createHarness(
+			store,
+			async () => ({ code: 0, stdout: "", stderr: "" }),
+			configStore,
+		);
+		const command = harness.commands.get("btw");
+
+		// auto-submit off (default) with a question -> no sentinel
+		await command?.handler("question", createCommandContext());
+		assert.equal(
+			(harness.execCalls[0]?.args ?? []).some((arg) => arg.includes("--launch-draft")),
+			false,
+		);
+
+		// auto-submit on but no draft question -> no sentinel
+		configStore.config = { ...DEFAULT_CONFIG, autoSubmit: true };
+		await command?.handler("", createCommandContext());
+		harness.cleanup();
+		assert.equal(
+			(harness.execCalls[1]?.args ?? []).some((arg) => arg.includes("--launch-draft")),
+			false,
+		);
 	});
 });
 
@@ -550,7 +584,25 @@ test("child quit keeps the launch directory while a merge is unacknowledged", as
 	});
 });
 
-test("child auto-submits a configured draft question", async () => {
+function createChildStartContext() {
+	const editorText: string[] = [];
+	const widgets: string[][] = [];
+	return {
+		ctx: {
+			mode: "tui",
+			ui: {
+				setTitle: () => undefined,
+				setWidget: (_name: string, lines: string[]) => widgets.push(lines),
+				setEditorText: (text: string) => editorText.push(text),
+				theme: { fg: (_color: string, text: string) => text },
+			},
+		},
+		editorText,
+		widgets,
+	};
+}
+
+test("child submits the auto-submit draft via the launch-draft sentinel, not session_start", async () => {
 	await withChildEnvironment("/tmp/pi-herdr-btw-test/launch-123/payload.json", async () => {
 		const store = new FakeStore();
 		store.readValue = fixturePayload({
@@ -559,26 +611,52 @@ test("child auto-submits a configured draft question", async () => {
 		});
 		const harness = await createHarness(store, async () => ({ code: 0, stdout: "", stderr: "" }));
 		harness.cleanup();
-		const editorText: string[] = [];
-		const widgets: string[][] = [];
-		await harness.emit(
-			"session_start",
-			{ reason: "startup" },
-			{
-				mode: "tui",
-				ui: {
-					setTitle: () => undefined,
-					setWidget: (_name: string, lines: string[]) => widgets.push(lines),
-					setEditorText: (text: string) => editorText.push(text),
-					theme: { fg: (_color: string, text: string) => text },
-				},
-			},
-		);
+		const { ctx, editorText, widgets } = createChildStartContext();
+		await harness.emit("session_start", { reason: "startup" }, ctx);
 
-		assert.deepEqual(harness.sentUserMessages, ["submit this"]);
+		// session_start must not send the draft: a message sent there lands in
+		// the session entries before renderInitialMessages() and paints twice.
+		assert.deepEqual(harness.sentUserMessages, []);
 		assert.deepEqual(editorText, []);
 		assert.match(widgets[0]?.join("\n") ?? "", /tool-free/);
 		assert.equal(widgets[0]?.length, 1);
+
+		// The sentinel (pi's initial message, processed after initial render)
+		// performs the one-shot submit.
+		const notifications: Array<{ message: string; type: string }> = [];
+		const commandCtx = {
+			sessionManager: { getEntries: () => [], getLeafId: () => null },
+			ui: { notify: (message: string, type: string) => notifications.push({ message, type }) },
+		};
+		await harness.commands.get("btw")?.handler("--launch-draft", commandCtx);
+		assert.deepEqual(harness.sentUserMessages, ["submit this"]);
+		assert.deepEqual(notifications, []);
+
+		// One-shot: a replay must not re-submit the draft.
+		await harness.commands.get("btw")?.handler("--launch-draft", commandCtx);
+		assert.deepEqual(harness.sentUserMessages, ["submit this"]);
+	});
+});
+
+test("child prefills the editor for non-auto-submit drafts and ignores a stray sentinel", async () => {
+	await withChildEnvironment("/tmp/pi-herdr-btw-test/launch-123/payload.json", async () => {
+		const store = new FakeStore();
+		store.readValue = fixturePayload({ draftQuestion: "draft only" });
+		const harness = await createHarness(store, async () => ({ code: 0, stdout: "", stderr: "" }));
+		harness.cleanup();
+		const { ctx, editorText } = createChildStartContext();
+		await harness.emit("session_start", { reason: "startup" }, ctx);
+
+		assert.deepEqual(editorText, ["draft only"]);
+		assert.deepEqual(harness.sentUserMessages, []);
+
+		// A sentinel against a non-auto-submit payload submits nothing.
+		const notifications: Array<{ message: string; type: string }> = [];
+		await harness.commands.get("btw")?.handler("--launch-draft", {
+			sessionManager: { getEntries: () => [], getLeafId: () => null },
+			ui: { notify: (message: string, type: string) => notifications.push({ message, type }) },
+		});
+		assert.deepEqual(harness.sentUserMessages, []);
 	});
 });
 

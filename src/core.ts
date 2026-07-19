@@ -12,6 +12,18 @@ import {
 
 export const PAYLOAD_VERSION = 3 as const;
 
+/**
+ * Sentinel argument for the child's `/btw` command. The parent passes
+ * `/btw --launch-draft` as the child pi's initial-message CLI argument so the
+ * auto-submit draft is sent *after* pi's initial render. Sending it from a
+ * `session_start` handler races pi's TUI startup (pi paints session entries
+ * after `session_start`, without deduping against live paints) and renders
+ * the question twice. Only the sentinel hits argv; the draft question itself
+ * stays in the private payload file.
+ */
+export const LAUNCH_DRAFT_ARG = "--launch-draft";
+export const LAUNCH_DRAFT_COMMAND = `/btw ${LAUNCH_DRAFT_ARG}`;
+
 export type BtwPayload = {
 	version: typeof PAYLOAD_VERSION;
 	createdAt: string;
@@ -67,6 +79,8 @@ export type HerdrLaunchOptions = {
 	/** Exact active parent tool names, used when toolMode is "inherit". */
 	activeTools: string[];
 	split: BtwSplit;
+	/** Optional initial message for the child pi, processed after initial render. */
+	initialMessage?: string;
 };
 
 export type LaunchResult = {
@@ -217,6 +231,7 @@ export function buildHerdrArgs(options: HerdrLaunchOptions): string[] {
 				: options.toolMode === "none"
 					? ["--no-tools"]
 					: []),
+		...(options.initialMessage ? [options.initialMessage] : []),
 	];
 }
 
