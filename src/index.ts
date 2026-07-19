@@ -371,7 +371,10 @@ export async function registerBtwExtension(
 	});
 
 	pi.registerCommand("btw", {
-		description: "Open a Herdr side thread (/btw), or use ask, config, merge, help",
+		// Pi has no argumentHint field for extension commands (only builtins and
+		// prompt templates); the TUI renders template hints as "hint — description",
+		// so we bake the same shape into the description.
+		description: "[question] — Open a Herdr side thread, or use ask, config, merge, help",
 		handler: async (args, ctx) => {
 			sessionCtx = ctx;
 			notifyFn = (message, type) => ctx.ui.notify(message, type);
