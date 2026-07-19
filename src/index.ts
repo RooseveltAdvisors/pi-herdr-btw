@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
 	buildSessionContext,
@@ -66,8 +65,6 @@ The child shares the parent's working directory. Tool actions can change files v
 type CacheMode = {
 	mode: "native" | "fallback";
 	reason?: string;
-	cacheRead?: number;
-	cacheWrite?: number;
 };
 
 function sameStringArray(a: string[], b: string[]): boolean {
@@ -95,22 +92,6 @@ export function decideCacheMode(
 		return { mode: "fallback", reason: "thinking level differs from parent" };
 	}
 	return { mode: "native" };
-}
-
-function extractCacheUsage(messages: AgentMessage[]): { cacheRead: number; cacheWrite: number } | undefined {
-	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		const message = messages[index] as {
-			role?: string;
-			usage?: { cacheRead?: number; cacheWrite?: number };
-		};
-		if (message?.role === "assistant" && message.usage) {
-			return {
-				cacheRead: message.usage.cacheRead ?? 0,
-				cacheWrite: message.usage.cacheWrite ?? 0,
-			};
-		}
-	}
-	return undefined;
 }
 
 async function configureChild(
@@ -147,24 +128,8 @@ async function configureChild(
 				: payload.config.tools === "read-only"
 					? "read-only"
 					: "tool-enabled";
-		const cacheLine =
-			cache.mode === "native"
-				? `prompt cache: native prefix mode${
-						cache.cacheRead !== undefined
-							? ` (read ${cache.cacheRead} / write ${cache.cacheWrite} tokens)`
-							: ""
-					}`
-				: `prompt cache: portable fallback — ${cache.reason ?? "unknown"}`;
 		widgetUi.setWidget("herdr-btw-context", [
-			widgetUi.theme.fg("accent", `BTW — ${capability} Herdr side thread`),
-			widgetUi.theme.fg("dim", "Static parent snapshot; use /btw merge to publish a reviewed summary back."),
-			widgetUi.theme.fg(
-				payload.config.tools === "none" ? "dim" : "warning",
-				payload.config.tools === "none"
-					? "Model tools are disabled for this side thread."
-					: "Shared cwd: tool actions can change files visible to the parent.",
-			),
-			widgetUi.theme.fg("dim", cacheLine),
+			widgetUi.theme.fg("accent", `BTW — ${capability} pane`),
 		]);
 	}
 
@@ -177,7 +142,6 @@ async function configureChild(
 		});
 		cache.mode = decision.mode;
 		cache.reason = decision.reason;
-		renderWidget();
 		if (cache.mode === "native") {
 			// Replay the parent's exact system prompt; side-pane policy moves to
 			// a suffix message so the cached prefix stays byte-identical.
@@ -200,14 +164,6 @@ async function configureChild(
 		return {
 			messages: [buildParentContextMessage(contextDocument ?? ""), ...event.messages],
 		};
-	});
-
-	pi.on("agent_end", (event) => {
-		const usage = extractCacheUsage(event.messages);
-		if (!usage) return;
-		cache.cacheRead = usage.cacheRead;
-		cache.cacheWrite = usage.cacheWrite;
-		renderWidget();
 	});
 
 	if (payloadError) {

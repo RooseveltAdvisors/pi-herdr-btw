@@ -578,7 +578,7 @@ test("child auto-submits a configured draft question", async () => {
 		assert.deepEqual(harness.sentUserMessages, ["submit this"]);
 		assert.deepEqual(editorText, []);
 		assert.match(widgets[0]?.join("\n") ?? "", /tool-free/);
-		assert.match(widgets[0]?.join("\n") ?? "", /tools are disabled/i);
+		assert.equal(widgets[0]?.length, 1);
 	});
 });
 

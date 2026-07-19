@@ -63,7 +63,7 @@ Settings are stored in Pi's agent directory (`~/.pi/agent/pi-herdr-btw.json` by 
 
 ## Prompt cache
 
-When the child inherits the parent's model, tools, and thinking level (the defaults), it replays the parent's exact system prompt and native messages so providers with prefix-based prompt caching (notably Anthropic) can reuse the warm parent cache. The side-pane widget reports the active mode and cache-read/write tokens. Configured model, tool, or thinking overrides are explicit cache-breaking choices; the child then falls back to a portable flattened snapshot and says why. OpenAI/gateway cache routing across the new child session is not guaranteed.
+When the child inherits the parent's model, tools, and thinking level (the defaults), it replays the parent's exact system prompt and native messages so providers with prefix-based prompt caching (notably Anthropic) can reuse the warm parent cache. Configured model, tool, or thinking overrides are explicit cache-breaking choices; the child then falls back to a portable flattened snapshot and says why. OpenAI/gateway cache routing across the new child session is not guaranteed.
 
 ## Caveats
 
