@@ -47,7 +47,8 @@ function fixtureRequest(payload: ReturnType<typeof fixturePayload>): MergeReques
 		parentSessionId: payload.parentSessionId,
 		capability: payload.capability,
 		createdAt: "2026-07-15T00:00:00.000Z",
-		summary: "reviewed summary",
+		summary: "packaged side-thread transcript",
+		prompt: "continue with the findings",
 	};
 }
 

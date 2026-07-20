@@ -151,6 +151,8 @@ test("payload creation and validation are versioned", () => {
 	assert.ok(payload.capability.length >= 64);
 	assert.notEqual(createPayload(fixturePayloadOptions()).capability, payload.capability);
 	assert.equal(isBtwPayload({ ...payload, version: 2 }), false);
+	assert.equal(isBtwPayload({ ...payload, parentPaneId: 5 }), false);
+	assert.equal(isBtwPayload({ ...payload, parentPaneId: null }), true);
 	assert.equal(isBtwPayload({ ...payload, draftQuestion: null }), false);
 	assert.equal(isBtwPayload({ ...payload, capability: "short" }), false);
 	assert.equal(isBtwPayload({ ...payload, messages: [{ notRole: true }] }), false);

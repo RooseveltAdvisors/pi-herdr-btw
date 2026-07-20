@@ -7,6 +7,7 @@ export function fixturePayloadOptions(
 	return {
 		createdAt: "2026-07-15T00:00:00.000Z",
 		parentSessionId: "12345678-1234-1234-1234-123456789abc",
+		parentPaneId: "w1:p1",
 		metadata: {
 			generatedAt: "2026-07-15T00:00:00.000Z",
 			cwd: "/tmp/project",

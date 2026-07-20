@@ -36,7 +36,7 @@ pi install /absolute/path/to/pi-herdr-btw
 /btw <question...>                open a side pane with a draft question
 /btw ask <question...>            escape hatch for questions starting with a reserved word
 /btw config [...]                 show or change defaults
-/btw merge [summary...]           review and publish a side-thread summary into the parent
+/btw merge <prompt...>            fold this side thread into the parent and continue with the prompt
 /btw help                         show the grammar
 ```
 
@@ -44,7 +44,9 @@ Only the exact first words `ask`, `config`, `merge`, and `help` are subcommands;
 
 ## Merge
 
-In the side pane, `/btw merge` prefills a multiline editor with the latest assistant answer (or your supplied text). The edited summary is delivered to the parent as one visible, context-participating message — it never triggers a model turn, waits for the parent to settle if it is busy, and survives reloads. In the parent, `/btw merge` rescans for pending requests.
+In the side pane, `/btw merge <prompt>` closes the loop: it packages the side conversation (user/assistant turns, no tool payloads) as a transcript, hands it to the parent together with your prompt, refocuses the parent pane, and closes the side pane. The parent appends the transcript as one visible, context-participating message and auto-submits your prompt, so it is already working with the side thread's findings by the time you are back. Bare `/btw merge` opens an editor to compose the prompt.
+
+Delivery waits for the parent to settle if it is busy and survives reloads; an unacknowledged merge outlives the closed pane until the parent picks it up. In the parent, `/btw merge` rescans for pending requests.
 
 ## Config
 
@@ -67,7 +69,7 @@ When the child inherits the parent's model, tools, and thinking level (the defau
 
 ## Caveats
 
-The child receives a static context snapshot and does not see later parent activity; use `/btw merge` to bring a reviewed summary back. The child shares the working directory, so enabled tools can modify shared files. Very large parent contexts may exceed the child's context limit.
+The child receives a static context snapshot and does not see later parent activity; use `/btw merge <prompt>` to fold the side thread back in. The child shares the working directory, so enabled tools can modify shared files. Very large parent contexts may exceed the child's context limit.
 
 Launch data is stored in a private temporary directory, removed when the child exits normally (unacknowledged merges are retained until delivered), and cleaned up after 24 hours if left stale.
 

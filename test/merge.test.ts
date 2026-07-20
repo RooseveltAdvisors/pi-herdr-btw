@@ -3,7 +3,7 @@ import test from "node:test";
 import type { BtwPayload } from "../src/core.ts";
 import {
 	buildMergeMessageContent,
-	extractMergeCandidate,
+	buildMergeTranscript,
 	hasMergedRequestId,
 	isMergeAck,
 	isMergeRequest,
@@ -26,7 +26,8 @@ function fixtureRequest(payload: BtwPayload, overrides: Partial<MergeRequest> = 
 		parentSessionId: payload.parentSessionId,
 		capability: payload.capability,
 		createdAt: "2026-07-15T00:00:00.000Z",
-		summary: "reviewed summary",
+		summary: "packaged side-thread transcript",
+		prompt: "continue with the findings",
 		...overrides,
 	};
 }
@@ -35,10 +36,13 @@ test("merge request and ack guards enforce protocol shape and bounds", () => {
 	const payload = fixturePayload();
 	const request = fixtureRequest(payload);
 	assert.equal(isMergeRequest(request), true);
-	assert.equal(isMergeRequest({ ...request, protocolVersion: 2 }), false);
+	assert.equal(isMergeRequest({ ...request, protocolVersion: 1 }), false);
 	assert.equal(isMergeRequest({ ...request, capability: "short" }), false);
 	assert.equal(isMergeRequest({ ...request, summary: "   " }), false);
 	assert.equal(isMergeRequest({ ...request, summary: "x".repeat(64 * 1024 + 1) }), false);
+	assert.equal(isMergeRequest({ ...request, prompt: "   " }), false);
+	assert.equal(isMergeRequest({ ...request, prompt: "x".repeat(16 * 1024 + 1) }), false);
+	assert.equal(isMergeRequest({ ...request, prompt: undefined }), false);
 
 	const ack: MergeAck = {
 		protocolVersion: MERGE_PROTOCOL_VERSION,
@@ -70,22 +74,60 @@ test("merge requests must echo the exact launch identity and session binding", (
 	);
 });
 
-test("extractMergeCandidate picks the latest text-bearing assistant answer", () => {
-	assert.equal(extractMergeCandidate([]), undefined);
+test("buildMergeTranscript packages text turns and skips tool payloads", () => {
+	assert.equal(buildMergeTranscript([]), undefined);
+	assert.equal(
+		buildMergeTranscript([
+			{ role: "toolResult", content: [{ type: "text", text: "tool noise" }], timestamp: 1 },
+		] as never[]),
+		undefined,
+	);
 	const messages = [
-		{ role: "user", content: [{ type: "text", text: "question" }], timestamp: 1 },
-		{ role: "assistant", content: [{ type: "text", text: "first answer" }], timestamp: 2 },
-		{ role: "assistant", content: [{ type: "toolCall", id: "t1" }], timestamp: 3 },
-		{ role: "assistant", content: [{ type: "text", text: "final answer" }], timestamp: 4 },
-		{ role: "user", content: [{ type: "text", text: "thanks" }], timestamp: 5 },
+		{ role: "user", content: [{ type: "text", text: "side question" }], timestamp: 1 },
+		{ role: "assistant", content: [{ type: "toolCall", id: "t1" }], timestamp: 2 },
+		{ role: "toolResult", content: [{ type: "text", text: "tool output" }], timestamp: 3 },
+		{ role: "assistant", content: [{ type: "text", text: "the finding" }], timestamp: 4 },
 	] as never[];
-	assert.equal(extractMergeCandidate(messages), "final answer");
+	assert.equal(
+		buildMergeTranscript(messages),
+		"User:\nside question\n\nAssistant:\nthe finding",
+	);
 });
 
-test("merge message content wraps the summary in a clear provenance envelope", () => {
-	const content = buildMergeMessageContent("  the summary  ");
-	assert.match(content, /^Merged from \/btw \(reviewed reference material\)/);
-	assert.match(content, /<btw-merge>\nthe summary\n<\/btw-merge>/);
+test("buildMergeTranscript drops whole turns from the head when over budget", () => {
+	const messages = [
+		{ role: "user", content: [{ type: "text", text: "old ".repeat(100) }], timestamp: 1 },
+		{ role: "assistant", content: [{ type: "text", text: "answer one" }], timestamp: 2 },
+		{ role: "user", content: [{ type: "text", text: "latest question" }], timestamp: 3 },
+		{ role: "assistant", content: [{ type: "text", text: "latest answer" }], timestamp: 4 },
+	] as never[];
+	const transcript = buildMergeTranscript(messages, 128) ?? "";
+	assert.match(transcript, /^\[earlier side-thread turns omitted/);
+	assert.match(transcript, /latest question/);
+	assert.match(transcript, /latest answer/);
+	assert.doesNotMatch(transcript, /old old/);
+
+	// A single oversized turn keeps its tail.
+	const oversized =
+		buildMergeTranscript(
+			[
+				{
+					role: "assistant",
+					content: [{ type: "text", text: `start ${"x".repeat(300)}end` }],
+					timestamp: 1,
+				},
+			] as never[],
+			64,
+		) ?? "";
+	assert.match(oversized, /^\[earlier side-thread turns omitted/);
+	assert.match(oversized, /xend$/);
+	assert.doesNotMatch(oversized, /start/);
+});
+
+test("merge message content wraps the transcript in a clear provenance envelope", () => {
+	const content = buildMergeMessageContent("  the transcript  ");
+	assert.match(content, /^Merged from \/btw \(side-thread transcript\)/);
+	assert.match(content, /<btw-merge>\nthe transcript\n<\/btw-merge>/);
 });
 
 type LaunchState = {
@@ -120,6 +162,7 @@ class FakeMergeStore implements MergeStorePort {
 
 function fakeSession(sessionId: string) {
 	const sent: Array<{ content: string; details: { requestId: string; launchId: string } }> = [];
+	const submitted: string[] = [];
 	const notifications: Array<{ message: string; type: string }> = [];
 	const entries: Array<{ type: string; customType?: string; details?: unknown }> = [];
 	let idle = true;
@@ -131,28 +174,31 @@ function fakeSession(sessionId: string) {
 			sent.push({ content, details });
 			entries.push({ type: "custom_message", customType: MERGE_CUSTOM_TYPE, details });
 		},
+		submitPrompt: (prompt) => submitted.push(prompt),
 		notify: (message, type) => notifications.push({ message, type }),
 	};
-	return { session, sent, notifications, entries, setIdle: (value: boolean) => (idle = value) };
+	return { session, sent, submitted, notifications, entries, setIdle: (value: boolean) => (idle = value) };
 }
 
-test("coordinator delivers a valid merge exactly once and acknowledges it", async () => {
+test("coordinator delivers a valid merge exactly once, submits its prompt, and acknowledges it", async () => {
 	const payload = fixturePayload();
 	const store = new FakeMergeStore();
 	store.launches.set("/launch/payload.json", { payload, request: fixtureRequest(payload) });
-	const { session, sent } = fakeSession(payload.parentSessionId);
+	const { session, sent, submitted } = fakeSession(payload.parentSessionId);
 	const coordinator = new MergeCoordinator(store, session);
 
 	const first = await coordinator.scan();
 	assert.deepEqual(first, { delivered: 1, deferred: 0, rejected: 0 });
 	assert.equal(sent.length, 1);
-	assert.match(sent[0]?.content ?? "", /reviewed summary/);
+	assert.match(sent[0]?.content ?? "", /packaged side-thread transcript/);
+	assert.deepEqual(submitted, ["continue with the findings"]);
 	assert.equal(store.launches.get("/launch/payload.json")?.ack?.status, "accepted");
 
-	// acked requests are never re-delivered
+	// acked requests are never re-delivered or re-submitted
 	const second = await coordinator.scan();
 	assert.deepEqual(second, { delivered: 0, deferred: 0, rejected: 0 });
 	assert.equal(sent.length, 1);
+	assert.deepEqual(submitted, ["continue with the findings"]);
 });
 
 test("a second merge is delivered even when a stale ack from the first remains", async () => {
@@ -182,17 +228,19 @@ test("coordinator defers while the parent is busy and delivers after it settles"
 	const payload = fixturePayload();
 	const store = new FakeMergeStore();
 	store.launches.set("/launch/payload.json", { payload, request: fixtureRequest(payload) });
-	const { session, sent, setIdle } = fakeSession(payload.parentSessionId);
+	const { session, sent, submitted, setIdle } = fakeSession(payload.parentSessionId);
 	const coordinator = new MergeCoordinator(store, session);
 
 	setIdle(false);
 	assert.deepEqual(await coordinator.scan(), { delivered: 0, deferred: 1, rejected: 0 });
 	assert.equal(sent.length, 0);
+	assert.deepEqual(submitted, []);
 	assert.equal(store.launches.get("/launch/payload.json")?.ack, undefined);
 
 	setIdle(true);
 	assert.deepEqual(await coordinator.scan(), { delivered: 1, deferred: 0, rejected: 0 });
 	assert.equal(sent.length, 1);
+	assert.deepEqual(submitted, ["continue with the findings"]);
 });
 
 test("coordinator ignores merges bound to other sessions", async () => {
@@ -230,13 +278,15 @@ test("coordinator re-acks without re-appending after an append-succeeded/ack-fai
 	const request = fixtureRequest(payload);
 	const store = new FakeMergeStore();
 	store.launches.set("/launch/payload.json", { payload, request });
-	const { session, sent, entries } = fakeSession(payload.parentSessionId);
+	const { session, sent, submitted, entries } = fakeSession(payload.parentSessionId);
 	// Simulate a previous append that persisted before the ack write crashed.
 	entries.push({ type: "custom_message", customType: MERGE_CUSTOM_TYPE, details: { requestId: request.requestId } });
 	const coordinator = new MergeCoordinator(store, session);
 
 	assert.deepEqual(await coordinator.scan(), { delivered: 0, deferred: 0, rejected: 0 });
 	assert.equal(sent.length, 0);
+	// The prompt is never re-submitted; that would double-trigger a paid turn.
+	assert.deepEqual(submitted, []);
 	assert.equal(store.launches.get("/launch/payload.json")?.ack?.status, "accepted");
 	assert.equal(hasMergedRequestId(entries, request.requestId), true);
 });

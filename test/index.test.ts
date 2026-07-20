@@ -262,6 +262,7 @@ test("parent command captures native context and launches Herdr without leaking 
 		const payload = store.created[0];
 		assert.equal(payload?.draftQuestion, "secret question");
 		assert.equal(payload?.parentSessionId, "12345678-1234-1234-1234-123456789abc");
+		assert.equal(payload?.parentPaneId, "w1:p1");
 		assert.equal(payload?.parentSystemPrompt, "parent system prompt");
 		assert.deepEqual(payload?.parentActiveTools, ["read", "bash"]);
 		assert.equal(payload?.parentThinkingLevel, "high");
@@ -455,7 +456,7 @@ test("parent omits the launch-draft sentinel when auto-submit is off or there is
 	});
 });
 
-test("parent merge scan delivers a pending, validated merge as a passive custom message", async () => {
+test("parent merge scan appends the transcript passively and auto-submits the prompt", async () => {
 	await withParentEnvironment(async () => {
 		const store = new FakeStore();
 		const payload = store.readValue;
@@ -466,7 +467,8 @@ test("parent merge scan delivers a pending, validated merge as a passive custom 
 			parentSessionId: payload.parentSessionId,
 			capability: payload.capability,
 			createdAt: "2026-07-15T00:05:00.000Z",
-			summary: "reviewed summary from the side thread",
+			summary: "packaged transcript from the side thread",
+			prompt: "apply the side-thread findings",
 		} satisfies MergeRequest;
 		const harness = await createHarness(store, async () => ({ code: 0, stdout: "", stderr: "" }));
 		const ctx = createCommandContext();
@@ -478,8 +480,10 @@ test("parent merge scan delivers a pending, validated merge as a passive custom 
 		const sent = harness.sentMessages[0];
 		assert.equal(sent?.message.customType, MERGE_CUSTOM_TYPE);
 		assert.equal(sent?.message.display, true);
-		assert.match(sent?.message.content ?? "", /<btw-merge>\nreviewed summary from the side thread\n<\/btw-merge>/);
+		assert.match(sent?.message.content ?? "", /<btw-merge>\npackaged transcript from the side thread\n<\/btw-merge>/);
 		assert.deepEqual(sent?.options, { triggerTurn: false });
+		// The transcript itself never triggers a turn; the prompt does.
+		assert.deepEqual(harness.sentUserMessages, ["apply the side-thread findings"]);
 		assert.equal(store.mergeAck?.status, "accepted");
 		assert.match(ctx.notifications.at(-1)?.message ?? "", /delivered 1/);
 	});
@@ -497,6 +501,7 @@ test("parent defers merge delivery while busy and delivers on agent_settled", as
 			capability: payload.capability,
 			createdAt: "2026-07-15T00:05:00.000Z",
 			summary: "deferred summary",
+			prompt: "deferred prompt",
 		} satisfies MergeRequest;
 		const harness = await createHarness(store, async () => ({ code: 0, stdout: "", stderr: "" }));
 		const ctx = createCommandContext();
@@ -505,6 +510,7 @@ test("parent defers merge delivery while busy and delivers on agent_settled", as
 
 		await harness.commands.get("btw")?.handler("merge", ctx);
 		assert.equal(harness.sentMessages.length, 0);
+		assert.deepEqual(harness.sentUserMessages, []);
 		assert.equal(store.mergeAck, undefined);
 		assert.match(ctx.notifications.at(-1)?.message ?? "", /pending/);
 
@@ -512,6 +518,7 @@ test("parent defers merge delivery while busy and delivers on agent_settled", as
 		await harness.emit("agent_settled", {}, ctx);
 		harness.cleanup();
 		assert.equal(harness.sentMessages.length, 1);
+		assert.deepEqual(harness.sentUserMessages, ["deferred prompt"]);
 		assert.equal((store.mergeAck as MergeAck | undefined)?.status, "accepted");
 	});
 });
@@ -528,6 +535,7 @@ test("parent rejects merges that fail capability validation", async () => {
 			capability: "f".repeat(64),
 			createdAt: "2026-07-15T00:05:00.000Z",
 			summary: "forged summary",
+			prompt: "forged prompt",
 		} satisfies MergeRequest;
 		const harness = await createHarness(store, async () => ({ code: 0, stdout: "", stderr: "" }));
 		const ctx = createCommandContext();
@@ -536,6 +544,7 @@ test("parent rejects merges that fail capability validation", async () => {
 		harness.cleanup();
 
 		assert.equal(harness.sentMessages.length, 0);
+		assert.deepEqual(harness.sentUserMessages, []);
 		assert.equal(store.mergeAck?.status, "rejected");
 		assert.match(store.mergeAck?.reason ?? "", /capability/);
 	});
@@ -747,67 +756,133 @@ test("decideCacheMode explains every fallback reason", () => {
 	);
 });
 
-test("child merge opens a reviewed editor and writes a bounded request", async () => {
+function createChildMergeContext(options: { editor?: (title: string, prefill?: string) => Promise<string | undefined> } = {}) {
+	const notifications: Array<{ message: string; type: string }> = [];
+	const entries = [
+		{
+			type: "message",
+			id: "m1",
+			parentId: null,
+			timestamp: "2026-07-15T00:00:00.000Z",
+			message: {
+				role: "user",
+				content: [{ type: "text", text: "side question" }],
+				timestamp: 1,
+			},
+		},
+		{
+			type: "message",
+			id: "m2",
+			parentId: "m1",
+			timestamp: "2026-07-15T00:00:01.000Z",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "the finding" }],
+				timestamp: 2,
+			},
+		},
+	];
+	const ctx = {
+		sessionManager: { getEntries: () => entries, getLeafId: () => "m2" },
+		ui: {
+			notify: (message: string, type: string) => notifications.push({ message, type }),
+			editor:
+				options.editor ??
+				(async () => {
+					throw new Error("editor must not open when a prompt is supplied");
+				}),
+		},
+	};
+	return { ctx, notifications };
+}
+
+async function withChildPaneId(paneId: string | undefined, run: () => Promise<void>): Promise<void> {
+	const previous = process.env.HERDR_PANE_ID;
+	if (paneId === undefined) delete process.env.HERDR_PANE_ID;
+	else process.env.HERDR_PANE_ID = paneId;
+	try {
+		await run();
+	} finally {
+		if (previous === undefined) delete process.env.HERDR_PANE_ID;
+		else process.env.HERDR_PANE_ID = previous;
+	}
+}
+
+test("child merge packages the transcript with the prompt, refocuses the parent, and closes its pane", async () => {
+	await withChildEnvironment("/tmp/pi-herdr-btw-test/launch-123/payload.json", async () => {
+		await withChildPaneId("w1:p9", async () => {
+			const store = new FakeStore();
+			const harness = await createHarness(store, async () => ({ code: 0, stdout: "", stderr: "" }));
+			harness.cleanup();
+			const { ctx } = createChildMergeContext();
+
+			await harness.commands.get("btw")?.handler("merge apply the findings", ctx);
+
+			const request = store.mergeRequest as MergeRequest;
+			assert.equal(request.prompt, "apply the findings");
+			assert.match(request.summary, /User:\nside question/);
+			assert.match(request.summary, /Assistant:\nthe finding/);
+			assert.equal(request.launchId, store.readValue.launchId);
+			assert.equal(request.capability, store.readValue.capability);
+			assert.equal(request.parentSessionId, store.readValue.parentSessionId);
+			// Close the loop: focus the parent pane, then close this one.
+			assert.deepEqual(harness.execCalls, [
+				{ command: "herdr", args: ["agent", "focus", "w1:p1"] },
+				{ command: "herdr", args: ["pane", "close", "w1:p9"] },
+			]);
+		});
+	});
+});
+
+test("child merge stays open and polls for the ack when it is not in a Herdr pane", async () => {
+	await withChildEnvironment("/tmp/pi-herdr-btw-test/launch-123/payload.json", async () => {
+		await withChildPaneId(undefined, async () => {
+			const store = new FakeStore();
+			const harness = await createHarness(store, async () => ({ code: 0, stdout: "", stderr: "" }));
+			harness.cleanup();
+			const { ctx, notifications } = createChildMergeContext();
+
+			const originalSetInterval = globalThis.setInterval;
+			const timers: Array<ReturnType<typeof setInterval>> = [];
+			(globalThis as any).setInterval = (...args: Parameters<typeof setInterval>) => {
+				const timer = originalSetInterval(...args);
+				timers.push(timer);
+				return timer;
+			};
+			try {
+				await harness.commands.get("btw")?.handler("merge apply the findings", ctx);
+			} finally {
+				(globalThis as any).setInterval = originalSetInterval;
+				for (const timer of timers) clearInterval(timer);
+			}
+
+			assert.ok(store.mergeRequest);
+			assert.deepEqual(harness.execCalls, []);
+			assert.match(notifications.at(-1)?.message ?? "", /Merge pending/);
+		});
+	});
+});
+
+test("child merge with no prompt composes one in the editor; cancellation writes nothing", async () => {
 	await withChildEnvironment("/tmp/pi-herdr-btw-test/launch-123/payload.json", async () => {
 		const store = new FakeStore();
 		const harness = await createHarness(store, async () => ({ code: 0, stdout: "", stderr: "" }));
 		harness.cleanup();
-		const command = harness.commands.get("btw");
-		assert.ok(command);
-
 		const editorCalls: Array<{ title: string; prefill?: string }> = [];
-		const notifications: Array<{ message: string; type: string }> = [];
-		const ctx = {
-			sessionManager: {
-				getEntries: () => [
-					{
-						type: "message",
-						id: "m1",
-						parentId: null,
-						timestamp: "2026-07-15T00:00:00.000Z",
-						message: {
-							role: "assistant",
-							content: [{ type: "text", text: "the side answer" }],
-							timestamp: 2,
-						},
-					},
-				],
-				getLeafId: () => "m1",
+		const { ctx, notifications } = createChildMergeContext({
+			editor: async (title: string, prefill?: string) => {
+				editorCalls.push({ title, prefill });
+				return undefined;
 			},
-			ui: {
-				notify: (message: string, type: string) => notifications.push({ message, type }),
-				editor: async (title: string, prefill?: string) => {
-					editorCalls.push({ title, prefill });
-					return "  edited summary  ";
-				},
-			},
-		};
-
-		const originalSetInterval = globalThis.setInterval;
-		const timers: Array<ReturnType<typeof setInterval>> = [];
-		(globalThis as any).setInterval = (...args: Parameters<typeof setInterval>) => {
-			const timer = originalSetInterval(...args);
-			timers.push(timer);
-			return timer;
-		};
-		try {
-			await command?.handler("merge", ctx);
-		} finally {
-			(globalThis as any).setInterval = originalSetInterval;
-			for (const timer of timers) clearInterval(timer);
-		}
-
-		assert.equal(editorCalls[0]?.prefill, "the side answer");
-		const request = store.mergeRequest as MergeRequest;
-		assert.equal(request.summary, "edited summary");
-		assert.equal(request.launchId, store.readValue.launchId);
-		assert.equal(request.capability, store.readValue.capability);
-		assert.equal(request.parentSessionId, store.readValue.parentSessionId);
-		assert.match(notifications.at(-1)?.message ?? "", /Merge pending/);
+		});
+		await harness.commands.get("btw")?.handler("merge", ctx);
+		assert.match(editorCalls[0]?.title ?? "", /Prompt for the parent/);
+		assert.equal(store.mergeRequest, undefined);
+		assert.match(notifications.at(-1)?.message ?? "", /cancelled/);
 	});
 });
 
-test("child merge cancellation writes nothing", async () => {
+test("child merge refuses an empty side thread", async () => {
 	await withChildEnvironment("/tmp/pi-herdr-btw-test/launch-123/payload.json", async () => {
 		const store = new FakeStore();
 		const harness = await createHarness(store, async () => ({ code: 0, stdout: "", stderr: "" }));
@@ -817,12 +892,12 @@ test("child merge cancellation writes nothing", async () => {
 			sessionManager: { getEntries: () => [], getLeafId: () => null },
 			ui: {
 				notify: (message: string, type: string) => notifications.push({ message, type }),
-				editor: async () => undefined,
 			},
 		};
-		await harness.commands.get("btw")?.handler("merge", ctx);
+		await harness.commands.get("btw")?.handler("merge apply the findings", ctx);
 		assert.equal(store.mergeRequest, undefined);
-		assert.match(notifications.at(-1)?.message ?? "", /cancelled/);
+		assert.deepEqual(harness.execCalls, []);
+		assert.match(notifications.at(-1)?.message ?? "", /no conversation yet/);
 	});
 });
 
@@ -840,7 +915,7 @@ test("child merge refuses to stack a second request on a pending one", async () 
 				editor: async () => "should not be reached",
 			},
 		};
-		await harness.commands.get("btw")?.handler("merge", ctx);
+		await harness.commands.get("btw")?.handler("merge another prompt", ctx);
 		assert.deepEqual(store.mergeRequest, { requestId: "req-1" });
 		assert.match(notifications.at(-1)?.message ?? "", /already pending/);
 	});

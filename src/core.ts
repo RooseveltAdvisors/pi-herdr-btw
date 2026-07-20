@@ -10,7 +10,7 @@ import {
 	type BtwToolMode,
 } from "./config.ts";
 
-export const PAYLOAD_VERSION = 3 as const;
+export const PAYLOAD_VERSION = 4 as const;
 
 /**
  * Sentinel argument for the child's `/btw` command. The parent passes
@@ -33,6 +33,8 @@ export type BtwPayload = {
 	capability: string;
 	/** Exact parent session ID at launch; merges are bound to it. */
 	parentSessionId: string;
+	/** Herdr pane ID of the parent at launch; /btw merge refocuses it. */
+	parentPaneId: string | null;
 	metadata: ParentContextMetadata;
 	/** Exact effective parent system prompt for the native-prefix cache path, if known. */
 	parentSystemPrompt: string | null;
@@ -49,6 +51,7 @@ export type BtwPayload = {
 export type CreatePayloadOptions = {
 	createdAt: string;
 	parentSessionId: string;
+	parentPaneId: string | null;
 	metadata: ParentContextMetadata;
 	parentSystemPrompt: string | null;
 	parentActiveTools: string[];
@@ -97,6 +100,7 @@ export function createPayload(options: CreatePayloadOptions): BtwPayload {
 		launchId: options.launchId ?? randomUUID(),
 		capability: options.capability ?? randomBytes(32).toString("hex"),
 		parentSessionId: options.parentSessionId,
+		parentPaneId: options.parentPaneId,
 		metadata: options.metadata,
 		parentSystemPrompt: options.parentSystemPrompt,
 		parentActiveTools: [...options.parentActiveTools],
@@ -119,6 +123,7 @@ export function isBtwPayload(value: unknown): value is BtwPayload {
 		payload.capability.length >= 32 &&
 		typeof payload.parentSessionId === "string" &&
 		payload.parentSessionId.length > 0 &&
+		(payload.parentPaneId === null || typeof payload.parentPaneId === "string") &&
 		!!payload.metadata &&
 		typeof payload.metadata === "object" &&
 		typeof payload.metadata.generatedAt === "string" &&
