@@ -14,16 +14,19 @@ import {
 } from "./config.ts";
 import { ContextStore } from "./context-store.ts";
 import {
+	buildAgentStartArgs,
 	buildContextDocument,
-	buildHerdrArgs,
 	buildNativeBridgeMessage,
 	buildParentContextMessage,
 	classifyLaunchResult,
 	createPayload,
 	LAUNCH_DRAFT_ARG,
 	LAUNCH_DRAFT_COMMAND,
+	buildPaneSplitArgs,
+	parsePaneSplitPaneId,
 	safeErrorText,
 	type BtwPayload,
+	type HerdrLaunchOptions,
 } from "./core.ts";
 import {
 	ackMatchesRequest,
@@ -516,11 +519,10 @@ export async function registerBtwExtension(
 					}),
 				);
 
-				const herdrArgs = buildHerdrArgs({
+				const launchOptions: HerdrLaunchOptions = {
 					paneName: `btw-${sessionId.slice(0, 6)}-${Date.now().toString(36).slice(-4)}`,
 					cwd: ctx.cwd,
-					workspaceId: process.env.HERDR_WORKSPACE_ID,
-					tabId: process.env.HERDR_TAB_ID,
+					parentPaneId: process.env.HERDR_PANE_ID,
 					payloadPath,
 					model: config.model ?? model,
 					thinkingLevel: config.thinking ?? thinkingLevel,
@@ -532,9 +534,44 @@ export async function registerBtwExtension(
 					// startup race; only this sentinel hits argv, never the question.
 					initialMessage:
 						config.autoSubmit && draftQuestion.trim() ? LAUNCH_DRAFT_COMMAND : undefined,
-				});
+				};
 
-				const result = await pi.exec("herdr", herdrArgs, { timeout: 10_000 });
+				// Step 1: create the side pane (carries cwd + payload env var).
+				const splitResult = await pi.exec("herdr", buildPaneSplitArgs(launchOptions), {
+					timeout: 10_000,
+				});
+				const splitOutcome = classifyLaunchResult(splitResult);
+				if (splitOutcome === "failed") {
+					await store.remove(payloadPath);
+					ctx.ui.notify(
+						`/btw failed: ${safeErrorText(splitResult.stdout, splitResult.stderr)}`,
+						"error",
+					);
+					return;
+				}
+				if (splitOutcome === "ambiguous") {
+					ensurePolling();
+					ctx.ui.notify(
+						"/btw launch timed out or was killed after it may have reached Herdr. Context cleanup is deferred in case the child pane is still starting.",
+						"warning",
+					);
+					return;
+				}
+
+				const paneId = parsePaneSplitPaneId(splitResult.stdout);
+				if (!paneId) {
+					await store.remove(payloadPath);
+					ctx.ui.notify(
+						"/btw failed: could not determine the new pane ID from `herdr pane split` output",
+						"error",
+					);
+					return;
+				}
+
+				// Step 2: adopt pi into the new pane; herdr waits for readiness.
+				const result = await pi.exec("herdr", buildAgentStartArgs(launchOptions, paneId), {
+					timeout: 45_000,
+				});
 				const outcome = classifyLaunchResult(result);
 				if (outcome === "success") {
 					ensurePolling();
@@ -542,6 +579,9 @@ export async function registerBtwExtension(
 				}
 
 				if (outcome === "failed") {
+					await pi
+						.exec("herdr", ["pane", "close", paneId], { timeout: 5_000 })
+						.catch(() => undefined);
 					await store.remove(payloadPath);
 					ctx.ui.notify(`/btw failed: ${safeErrorText(result.stdout, result.stderr)}`, "error");
 					return;

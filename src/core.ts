@@ -73,8 +73,8 @@ export type ParentContextMetadata = {
 export type HerdrLaunchOptions = {
 	paneName: string;
 	cwd: string;
-	workspaceId?: string;
-	tabId?: string;
+	/** Herdr pane ID of the parent; the side pane splits from it. Falls back to the focused pane. */
+	parentPaneId?: string;
 	payloadPath: string;
 	model: string;
 	thinkingLevel: string;
@@ -206,22 +206,53 @@ export function buildNativeBridgeMessage(instructions: string, draftHint?: strin
 	};
 }
 
-export function buildHerdrArgs(options: HerdrLaunchOptions): string[] {
+/**
+ * Step 1 of the launch: split a new pane off the parent (or focused) pane.
+ * Herdr >= 0.7 removed pane creation from `agent start`, so /btw first
+ * creates the pane (`pane split`) and then adopts pi into it (`agent start`).
+ */
+export function buildPaneSplitArgs(options: HerdrLaunchOptions): string[] {
+	return [
+		"pane",
+		"split",
+		...(options.parentPaneId ? ["--pane", options.parentPaneId] : ["--current"]),
+		"--direction",
+		options.split,
+		"--cwd",
+		options.cwd,
+		"--env",
+		`PI_HERDR_BTW_PAYLOAD=${options.payloadPath}`,
+		"--focus",
+	];
+}
+
+/** Extract the new pane ID from `herdr pane split` JSON output. */
+export function parsePaneSplitPaneId(stdout: string): string | null {
+	try {
+		const parsed = JSON.parse(stdout) as {
+			result?: { pane?: { pane_id?: unknown } };
+		};
+		const paneId = parsed?.result?.pane?.pane_id;
+		return typeof paneId === "string" && paneId.length > 0 ? paneId : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Step 2 of the launch: start pi in the freshly split pane. Herdr prepends
+ * the canonical executable for `--kind pi`, so only pi's own args follow `--`.
+ */
+export function buildAgentStartArgs(options: HerdrLaunchOptions, paneId: string): string[] {
 	return [
 		"agent",
 		"start",
 		options.paneName,
-		"--cwd",
-		options.cwd,
-		...(options.workspaceId ? ["--workspace", options.workspaceId] : []),
-		...(options.tabId ? ["--tab", options.tabId] : []),
-		"--split",
-		options.split,
-		"--env",
-		`PI_HERDR_BTW_PAYLOAD=${options.payloadPath}`,
-		"--focus",
-		"--",
+		"--kind",
 		"pi",
+		"--pane",
+		paneId,
+		"--",
 		"--no-session",
 		"--model",
 		options.model,
@@ -245,6 +276,19 @@ export function classifyLaunchResult(result: LaunchResult): LaunchOutcome {
 	return result.code === 0 ? "success" : "failed";
 }
 
+/**
+ * Herdr CLI failures print the whole JSON response on stderr
+ * (`{"id":...,"error":{"code":...,"message":...}}`, exit 1); extract the
+ * human message when present, otherwise fall back to the raw text.
+ */
 export function safeErrorText(stdout: string, stderr: string): string {
-	return (stderr.trim() || stdout.trim() || "Herdr failed to create the side pane").slice(0, 500);
+	const raw = stderr.trim() || stdout.trim() || "Herdr failed to create the side pane";
+	try {
+		const parsed = JSON.parse(raw) as { error?: { message?: unknown } };
+		const message = parsed?.error?.message;
+		if (typeof message === "string" && message.length > 0) return message.slice(0, 500);
+	} catch {
+		// not JSON; use the raw text
+	}
+	return raw.slice(0, 500);
 }

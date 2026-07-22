@@ -30,6 +30,21 @@ type ExecResult = {
 	killed?: boolean;
 };
 
+const PANE_SPLIT_STDOUT = JSON.stringify({
+	id: "cli:pane:split",
+	result: { pane: { pane_id: "w1:p9", tab_id: "w1:t1", workspace_id: "w1" }, type: "pane_info" },
+});
+
+/** Herdr exec stub: pane split succeeds with a pane ID; agent start uses the given result. */
+function herdrExec(agentStart: ExecResult = { code: 0, stdout: "ok", stderr: "" }) {
+	return async (_command: string, args: string[]): Promise<ExecResult> => {
+		if (args[0] === "pane" && args[1] === "split") {
+			return { code: 0, stdout: PANE_SPLIT_STDOUT, stderr: "" };
+		}
+		return agentStart;
+	};
+}
+
 class FakeStore implements ContextStorePort {
 	readonly payloadPath = "/tmp/pi-herdr-btw-test/launch-123/payload.json";
 	readonly created: BtwPayload[] = [];
@@ -249,11 +264,7 @@ async function withChildEnvironment(payloadPath: string, run: () => Promise<void
 test("parent command captures native context and launches Herdr without leaking the question", async () => {
 	await withParentEnvironment(async () => {
 		const store = new FakeStore();
-		const harness = await createHarness(store, async () => ({
-			code: 0,
-			stdout: "ok",
-			stderr: "",
-		}));
+		const harness = await createHarness(store, herdrExec());
 		const ctx = createCommandContext();
 		await harness.commands.get("btw")?.handler("  secret question  ", ctx);
 		harness.cleanup();
@@ -270,21 +281,37 @@ test("parent command captures native context and launches Herdr without leaking 
 		assert.ok(payload?.launchId);
 		assert.ok((payload?.capability.length ?? 0) >= 64);
 		assert.deepEqual(store.removed, []);
-		assert.equal(harness.execCalls.length, 1);
+		assert.equal(harness.execCalls.length, 2);
 		assert.equal(harness.execCalls[0]?.command, "herdr");
-		const args = harness.execCalls[0]?.args ?? [];
-		assert.equal(args.some((arg) => arg.includes("secret question")), false);
-		assert.equal(args.some((arg) => arg.includes(payload?.capability ?? "!")), false);
-		assert.ok(args.includes("PI_HERDR_BTW_PAYLOAD=/tmp/pi-herdr-btw-test/launch-123/payload.json"));
+		assert.equal(harness.execCalls[1]?.command, "herdr");
+		const splitArgs = harness.execCalls[0]?.args ?? [];
+		const startArgs = harness.execCalls[1]?.args ?? [];
+		const allArgs = [...splitArgs, ...startArgs];
+		assert.deepEqual(splitArgs.slice(0, 2), ["pane", "split"]);
+		assert.deepEqual(splitArgs.slice(splitArgs.indexOf("--pane"), splitArgs.indexOf("--pane") + 2), [
+			"--pane",
+			"w1:p1",
+		]);
+		assert.deepEqual(startArgs.slice(0, 2), ["agent", "start"]);
+		// agent start targets the pane returned by pane split
+		assert.deepEqual(startArgs.slice(startArgs.indexOf("--pane"), startArgs.indexOf("--pane") + 2), [
+			"--pane",
+			"w1:p9",
+		]);
+		assert.equal(allArgs.some((arg) => arg.includes("secret question")), false);
+		assert.equal(allArgs.some((arg) => arg.includes(payload?.capability ?? "!")), false);
+		assert.ok(
+			splitArgs.includes("PI_HERDR_BTW_PAYLOAD=/tmp/pi-herdr-btw-test/launch-123/payload.json"),
+		);
 		// tools inherit (default) passes the exact active parent tool set
-		assert.deepEqual(args.slice(-2), ["--tools", "read,bash"]);
+		assert.deepEqual(startArgs.slice(-2), ["--tools", "read,bash"]);
 	});
 });
 
 test("parent command routes ask, help, and unknown words by exact first word", async () => {
 	await withParentEnvironment(async () => {
 		const store = new FakeStore();
-		const harness = await createHarness(store, async () => ({ code: 0, stdout: "", stderr: "" }));
+		const harness = await createHarness(store, herdrExec());
 		const ctx = createCommandContext();
 		const command = harness.commands.get("btw");
 
@@ -346,7 +373,7 @@ test("config subcommand updates and resets launch defaults, including malformed-
 	});
 });
 
-test("parent command removes sensitive payload after a definite nonzero launch failure", async () => {
+test("parent command removes sensitive payload after a definite nonzero split failure", async () => {
 	await withParentEnvironment(async () => {
 		const store = new FakeStore();
 		const harness = await createHarness(store, async () => ({
@@ -358,6 +385,7 @@ test("parent command removes sensitive payload after a definite nonzero launch f
 		await harness.commands.get("btw")?.handler("question", ctx);
 		harness.cleanup();
 
+		assert.equal(harness.execCalls.length, 1);
 		assert.deepEqual(store.removed, [store.payloadPath]);
 		assert.deepEqual(ctx.notifications.at(-1), {
 			message: "/btw failed: no server",
@@ -366,15 +394,53 @@ test("parent command removes sensitive payload after a definite nonzero launch f
 	});
 });
 
-test("parent command retains payload for an ambiguous killed launch", async () => {
+test("parent command closes the split pane and removes payload when agent start fails", async () => {
+	await withParentEnvironment(async () => {
+		const store = new FakeStore();
+		const harness = await createHarness(
+			store,
+			herdrExec({ code: 1, stdout: "", stderr: "pi not found" }),
+		);
+		const ctx = createCommandContext();
+		await harness.commands.get("btw")?.handler("question", ctx);
+		harness.cleanup();
+
+		assert.equal(harness.execCalls.length, 3);
+		assert.deepEqual(harness.execCalls[2]?.args, ["pane", "close", "w1:p9"]);
+		assert.deepEqual(store.removed, [store.payloadPath]);
+		assert.deepEqual(ctx.notifications.at(-1), {
+			message: "/btw failed: pi not found",
+			type: "error",
+		});
+	});
+});
+
+test("parent command removes payload when pane split output has no pane ID", async () => {
 	await withParentEnvironment(async () => {
 		const store = new FakeStore();
 		const harness = await createHarness(store, async () => ({
-			code: 1,
-			stdout: "",
-			stderr: "timeout",
-			killed: true,
+			code: 0,
+			stdout: "not json",
+			stderr: "",
 		}));
+		const ctx = createCommandContext();
+		await harness.commands.get("btw")?.handler("question", ctx);
+		harness.cleanup();
+
+		assert.equal(harness.execCalls.length, 1);
+		assert.deepEqual(store.removed, [store.payloadPath]);
+		assert.equal(ctx.notifications.at(-1)?.type, "error");
+		assert.match(ctx.notifications.at(-1)?.message ?? "", /pane ID/);
+	});
+});
+
+test("parent command retains payload for an ambiguous killed launch", async () => {
+	await withParentEnvironment(async () => {
+		const store = new FakeStore();
+		const harness = await createHarness(
+			store,
+			herdrExec({ code: 1, stdout: "", stderr: "timeout", killed: true }),
+		);
 		const ctx = createCommandContext();
 		await harness.commands.get("btw")?.handler("question", ctx);
 		harness.cleanup();
@@ -396,16 +462,17 @@ test("parent command applies configured model, thinking, tools, and split", asyn
 			tools: "none",
 			split: "down",
 		};
-		const harness = await createHarness(
-			store,
-			async () => ({ code: 0, stdout: "", stderr: "" }),
-			configStore,
-		);
+		const harness = await createHarness(store, herdrExec(), configStore);
 		await harness.commands.get("btw")?.handler("question", createCommandContext());
 		harness.cleanup();
 
 		assert.deepEqual(store.created[0]?.config, configStore.config);
-		const args = harness.execCalls[0]?.args ?? [];
+		const splitArgs = harness.execCalls[0]?.args ?? [];
+		const args = harness.execCalls[1]?.args ?? [];
+		assert.deepEqual(
+			splitArgs.slice(splitArgs.indexOf("--direction"), splitArgs.indexOf("--direction") + 2),
+			["--direction", "down"],
+		);
 		assert.deepEqual(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2), [
 			"--model",
 			"anthropic/claude-haiku",
@@ -414,16 +481,15 @@ test("parent command applies configured model, thinking, tools, and split", asyn
 			"--thinking",
 			"low",
 		]);
-		assert.deepEqual(args.slice(args.indexOf("--split"), args.indexOf("--split") + 2), [
-			"--split",
-			"down",
-		]);
 		// autoSubmit launches carry the launch-draft sentinel as pi's initial
 		// message so the child submits the draft after initial render (avoids
 		// the double-paint startup race); the question itself never hits argv.
 		assert.equal(args.at(-1), "/btw --launch-draft");
 		assert.equal(args.at(-2), "--no-tools");
-		assert.equal(args.some((arg) => arg.includes("question")), false);
+		assert.equal(
+			[...splitArgs, ...args].some((arg) => arg.includes("question")),
+			false,
+		);
 	});
 });
 
@@ -431,17 +497,13 @@ test("parent omits the launch-draft sentinel when auto-submit is off or there is
 	await withParentEnvironment(async () => {
 		const store = new FakeStore();
 		const configStore = new FakeConfigStore();
-		const harness = await createHarness(
-			store,
-			async () => ({ code: 0, stdout: "", stderr: "" }),
-			configStore,
-		);
+		const harness = await createHarness(store, herdrExec(), configStore);
 		const command = harness.commands.get("btw");
 
 		// auto-submit off (default) with a question -> no sentinel
 		await command?.handler("question", createCommandContext());
 		assert.equal(
-			(harness.execCalls[0]?.args ?? []).some((arg) => arg.includes("--launch-draft")),
+			(harness.execCalls[1]?.args ?? []).some((arg) => arg.includes("--launch-draft")),
 			false,
 		);
 
@@ -450,7 +512,7 @@ test("parent omits the launch-draft sentinel when auto-submit is off or there is
 		await command?.handler("", createCommandContext());
 		harness.cleanup();
 		assert.equal(
-			(harness.execCalls[1]?.args ?? []).some((arg) => arg.includes("--launch-draft")),
+			(harness.execCalls[3]?.args ?? []).some((arg) => arg.includes("--launch-draft")),
 			false,
 		);
 	});

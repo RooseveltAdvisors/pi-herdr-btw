@@ -14,7 +14,7 @@ Unlike Claude Code's one-shot, tool-free overlay, this side thread runs in a sep
 
 ## Requirements
 
-- [Pi](https://pi.dev/) and [Herdr](https://herdr.dev) installed.
+- [Pi](https://pi.dev/) and [Herdr](https://herdr.dev) v0.7.4+ installed (launches use `herdr pane split` + `herdr agent start --kind pi --pane`).
 - Pi running in a Herdr-managed pane
 
 ## Install
