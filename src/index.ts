@@ -19,6 +19,7 @@ import {
 	buildNativeBridgeMessage,
 	buildParentContextMessage,
 	classifyLaunchResult,
+	isPaneShellNotReady,
 	createPayload,
 	LAUNCH_DRAFT_ARG,
 	LAUNCH_DRAFT_COMMAND,
@@ -568,10 +569,18 @@ export async function registerBtwExtension(
 					return;
 				}
 
-				// Step 2: adopt pi into the new pane; herdr waits for readiness.
-				const result = await pi.exec("herdr", buildAgentStartArgs(launchOptions, paneId), {
-					timeout: 45_000,
-				});
+				// Step 2: adopt pi into the new pane. A fresh split pane can report
+				// "not an available shell" until its shell prompt is up; retry that
+				// class within the launch budget instead of failing the launch.
+				const startArgs = buildAgentStartArgs(launchOptions, paneId);
+				const deadline = Date.now() + 45_000;
+				let result = await pi.exec("herdr", startArgs, { timeout: 45_000 });
+				while (isPaneShellNotReady(result) && Date.now() < deadline) {
+					await new Promise((resolve) => setTimeout(resolve, 500));
+					result = await pi.exec("herdr", startArgs, {
+						timeout: Math.max(1_000, deadline - Date.now()),
+					});
+				}
 				const outcome = classifyLaunchResult(result);
 				if (outcome === "success") {
 					ensurePolling();

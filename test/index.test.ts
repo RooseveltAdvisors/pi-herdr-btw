@@ -421,6 +421,43 @@ test("parent command closes the split pane and removes payload when agent start 
 	});
 });
 
+test("parent command retries agent start while the fresh pane's shell is not ready", async () => {
+	await withParentEnvironment(async () => {
+		const store = new FakeStore();
+		let starts = 0;
+		const harness = await createHarness(store, async (_command: string, args: string[]) => {
+			if (args[0] === "pane" && args[1] === "split") {
+				return { code: 0, stdout: PANE_SPLIT_STDOUT, stderr: "" };
+			}
+			starts += 1;
+			return starts === 1
+				? {
+						code: 1,
+						stdout: "",
+						stderr: JSON.stringify({
+							id: "cli:agent:start",
+							error: {
+								code: "agent_pane_busy",
+								message: "agent target pane w1:p9 is not an available shell",
+							},
+						}),
+					}
+				: { code: 0, stdout: "ok", stderr: "" };
+		});
+		const ctx = createCommandContext();
+		await harness.commands.get("btw")?.handler("question", ctx);
+		harness.cleanup();
+
+		// first start hit the shell-readiness race, retry on the same pane succeeded
+		assert.equal(starts, 2);
+		assert.deepEqual(store.removed, []);
+		assert.equal(
+			ctx.notifications.some((n: { type: string }) => n.type === "error"),
+			false,
+		);
+	});
+});
+
 test("parent command removes payload when pane split output has no pane ID", async () => {
 	await withParentEnvironment(async () => {
 		const store = new FakeStore();
