@@ -305,6 +305,12 @@ test("parent command captures native context and launches Herdr without leaking 
 		);
 		// tools inherit (default) passes the exact active parent tool set
 		assert.deepEqual(startArgs.slice(-2), ["--tools", "read,bash"]);
+		// cwd lives only on pane split (for inheritance); agent start must never receive --cwd or the cwd value
+		// (old single-call construction sent --cwd to "herdr agent start" and produced "unknown option: --cwd")
+		assert.ok(splitArgs.includes("--cwd"));
+		assert.ok(splitArgs.includes("/tmp/project"));
+		assert.equal(startArgs.includes("--cwd"), false);
+		assert.ok(!startArgs.some((a) => a.includes("/tmp/project")));
 	});
 });
 
