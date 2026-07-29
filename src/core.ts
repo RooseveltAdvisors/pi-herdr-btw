@@ -277,6 +277,24 @@ export function classifyLaunchResult(result: LaunchResult): LaunchOutcome {
 }
 
 /**
+ * True when `agent start` failed only because the freshly split pane's shell
+ * is not at an interactive prompt yet (herdr 0.7.5 returns agent_pane_busy
+ * immediately after `pane split`); retrying the same pane shortly succeeds.
+ */
+export function isPaneShellNotReady(result: {
+	code: number;
+	killed?: boolean;
+	stdout: string;
+	stderr: string;
+}): boolean {
+	return (
+		!result.killed &&
+		result.code !== 0 &&
+		/agent_pane_busy|not an available shell/i.test(`${result.stdout}\n${result.stderr}`)
+	);
+}
+
+/**
  * Herdr CLI failures print the whole JSON response on stderr
  * (`{"id":...,"error":{"code":...,"message":...}}`, exit 1); extract the
  * human message when present, otherwise fall back to the raw text.
