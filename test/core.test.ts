@@ -10,6 +10,7 @@ import {
 	classifyLaunchResult,
 	createPayload,
 	isBtwPayload,
+	isPaneShellNotReady,
 	parsePaneSplitPaneId,
 	safeErrorText,
 } from "../src/core.ts";
@@ -217,4 +218,15 @@ test("safeErrorText extracts the message from Herdr JSON error responses", () =>
 	assert.equal(safeErrorText("", jsonError), "agent target pane w1:p9 is not an available shell");
 	// JSON without an error message falls back to the raw text
 	assert.equal(safeErrorText("", '{"result":{}}'), '{"result":{}}');
+});
+
+test("isPaneShellNotReady matches only the fresh-pane shell-readiness failure class", () => {
+	const busy = JSON.stringify({
+		id: "cli:agent:start",
+		error: { code: "agent_pane_busy", message: "agent target pane w1:p9 is not an available shell" },
+	});
+	assert.equal(isPaneShellNotReady({ code: 1, stdout: "", stderr: busy }), true);
+	assert.equal(isPaneShellNotReady({ code: 0, stdout: "", stderr: busy }), false);
+	assert.equal(isPaneShellNotReady({ code: 1, killed: true, stdout: "", stderr: busy }), false);
+	assert.equal(isPaneShellNotReady({ code: 1, stdout: "", stderr: "pi not found" }), false);
 });
