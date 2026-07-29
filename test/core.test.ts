@@ -72,6 +72,42 @@ test("buildPaneSplitArgs splits the parent pane with cwd and payload env only", 
 	assert.equal(args.some((arg) => arg.includes("secret question")), false);
 });
 
+test("buildPaneSplitArgs places --cwd on pane split (for cwd inheritance) and buildAgentStartArgs never leaks --cwd or the cwd value (prevents 'unknown option: --cwd' on current herdr agent start)", () => {
+	const cwdWithSpace = "/tmp/project with spaces";
+	const splitArgs = buildPaneSplitArgs({
+		paneName: "btw-abc123",
+		cwd: cwdWithSpace,
+		parentPaneId: "w1:p1",
+		payloadPath: "/tmp/pi-herdr-btw-1000/launch-abc/payload.json",
+		model: "provider/model",
+		thinkingLevel: "high",
+		toolMode: "read-only",
+		activeTools: ["read", "bash"],
+		split: "right",
+	});
+	assert.ok(splitArgs.includes("--cwd"));
+	assert.ok(splitArgs.includes(cwdWithSpace));
+
+	const startArgs = buildAgentStartArgs(
+		{
+			paneName: "btw-abc123",
+			cwd: cwdWithSpace,
+			payloadPath: "/tmp/payload.json",
+			model: "provider/model",
+			thinkingLevel: "high",
+			toolMode: "read-only",
+			activeTools: ["read", "bash"],
+			split: "right",
+		},
+		"w29:p2",
+	);
+	assert.equal(startArgs.includes("--cwd"), false);
+	assert.ok(!startArgs.some((a) => a.includes(cwdWithSpace) || a.includes("project with spaces")));
+	// agent start must target pane, not recreate
+	assert.deepEqual(startArgs.slice(0, 2), ["agent", "start"]);
+	assert.ok(startArgs.includes("--pane"));
+});
+
 test("buildPaneSplitArgs falls back to the current pane without a parent pane ID", () => {
 	const args = buildPaneSplitArgs({
 		paneName: "btw-abc123",
