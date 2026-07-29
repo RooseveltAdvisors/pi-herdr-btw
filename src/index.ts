@@ -577,8 +577,10 @@ export async function registerBtwExtension(
 				let result = await pi.exec("herdr", startArgs, { timeout: 45_000 });
 				while (isPaneShellNotReady(result) && Date.now() < deadline) {
 					await new Promise((resolve) => setTimeout(resolve, 500));
+					const remaining = deadline - Date.now();
+					if (remaining <= 0) break;
 					result = await pi.exec("herdr", startArgs, {
-						timeout: Math.max(1_000, deadline - Date.now()),
+						timeout: remaining,
 					});
 				}
 				const outcome = classifyLaunchResult(result);
