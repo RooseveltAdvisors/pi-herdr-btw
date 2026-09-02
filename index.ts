@@ -11,8 +11,8 @@ import {
 	ConfigStore,
 	formatConfig,
 	type BtwConfig,
-} from "./config.ts";
-import { ContextStore } from "./context-store.ts";
+} from "./src/config.ts";
+import { ContextStore } from "./src/context-store.ts";
 import {
 	buildAgentStartArgs,
 	buildContextDocument,
@@ -27,7 +27,7 @@ import {
 	safeErrorText,
 	type BtwPayload,
 	type HerdrLaunchOptions,
-} from "./core.ts";
+} from "./src/core.ts";
 import {
 	ackMatchesRequest,
 	buildMergeTranscript,
@@ -38,8 +38,8 @@ import {
 	MERGE_PROTOCOL_VERSION,
 	MergeCoordinator,
 	type MergeRequest,
-} from "./merge.ts";
-import { HELP_TEXT, parseBtwCommand } from "./router.ts";
+} from "./src/merge.ts";
+import { HELP_TEXT, parseBtwCommand } from "./src/router.ts";
 
 const CHILD_PAYLOAD_ENV = "PI_HERDR_BTW_PAYLOAD";
 const MERGE_POLL_INTERVAL_MS = 3_000;
