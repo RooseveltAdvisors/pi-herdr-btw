@@ -1,6 +1,6 @@
 {
   "name": "pi-herdr-btw",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Open a tool-enabled Pi side thread in a focused Herdr pane without changing the parent transcript.",
   "type": "module",
   "author": "Oscar Gabriel",
