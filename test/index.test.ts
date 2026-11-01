@@ -303,8 +303,10 @@ test("parent command captures native context and launches Herdr without leaking 
 		assert.ok(
 			splitArgs.includes("PI_HERDR_BTW_PAYLOAD=/tmp/pi-herdr-btw-test/launch-123/payload.json"),
 		);
-		// tools inherit (default) passes the exact active parent tool set
-		assert.deepEqual(startArgs.slice(-2), ["--tools", "read,bash"]);
+		// tools all (default) passes no --tools flag so Pi uses its full tool set
+		const sargs = harness.execCalls[1]?.args ?? [];
+		assert.equal(sargs.includes("--tools"), false);
+		assert.equal(sargs.includes("--no-tools"), false);
 		// cwd lives only on pane split (for inheritance); agent start must never receive --cwd or the cwd value
 		// (old single-call construction sent --cwd to "herdr agent start" and produced "unknown option: --cwd")
 		assert.ok(splitArgs.includes("--cwd"));
@@ -777,6 +779,7 @@ test("child prefills the editor for non-auto-submit drafts and ignores a stray s
 test("child uses the native prefix when model, tools, and thinking match the parent", async () => {
 	await withChildEnvironment("/tmp/pi-herdr-btw-test/launch-123/payload.json", async () => {
 		const store = new FakeStore();
+		store.readValue = fixturePayload({ config: { ...DEFAULT_CONFIG, tools: "inherit" } });
 		const harness = await createHarness(store, async () => ({ code: 0, stdout: "", stderr: "" }));
 		harness.cleanup();
 		const ctx = { model: { provider: "test-provider", id: "test-model" } };
@@ -831,7 +834,7 @@ test("child falls back to the portable document when the prefix cannot match", a
 });
 
 test("decideCacheMode explains every fallback reason", () => {
-	const payload = fixturePayload();
+	const payload = fixturePayload({ config: { ...DEFAULT_CONFIG, tools: "inherit" } });
 	const matching = {
 		model: "test-provider/test-model",
 		activeTools: ["read", "bash"],

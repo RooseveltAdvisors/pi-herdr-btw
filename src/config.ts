@@ -20,7 +20,7 @@ export const DEFAULT_CONFIG: Readonly<BtwConfig> = Object.freeze({
 	autoSubmit: false,
 	model: null,
 	thinking: null,
-	tools: "inherit",
+	tools: "all",
 	split: "right",
 });
 
